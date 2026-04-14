@@ -3,6 +3,8 @@
 #include <algorithm>
 
 #include "ctranslate2/decoding.h"
+#include "ctranslate2/ops/topk.h"
+#include "ctranslate2/ops/slide.h"
 
 #include "dispatch.h"
 #include "dtw.h"
@@ -725,6 +727,224 @@ namespace ctranslate2 {
                                median_filter_width);
         },
         batch_size);
+    }
+
+
+    std::pair<WhisperDecoderState, StorageView>
+    WhisperReplica::prefill(StorageView features,
+                            const std::vector<size_t>& prompt) {
+      PROFILE("WhisperReplica::prefill");
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      const Device device = _decoder->device();
+
+      layers::DecoderState state = _decoder->initial_state();
+      state.emplace("memory", maybe_encode(std::move(features)));
+      _decoder->update_output_layer(_model->preferred_size_multiple());
+
+      if (prompt.size() > 1) {
+        std::vector<std::vector<size_t>> prompt_batch = {
+          std::vector<size_t>(prompt.begin(), prompt.end() - 1)
+        };
+        const StorageView inputs = layers::make_sequence_inputs(prompt_batch, device);
+        _decoder->forward_prompt(inputs, state);
+      }
+
+      const dim_t start_step = prompt.size() > 1
+          ? static_cast<dim_t>(prompt.size()) - 1
+          : 0;
+
+      StorageView last_id({1}, int32_t(prompt.back()), device);
+      StorageView logits(_decoder->output_type(), device);
+      (*_decoder)(start_step, last_id, state, &logits);
+
+      WhisperDecoderState wds;
+      wds.state = std::move(state);
+      wds.current_step = static_cast<dim_t>(prompt.size());
+
+      return {std::move(wds), std::move(logits)};
+    }
+
+    StorageView
+    WhisperReplica::forward_step(WhisperDecoderState& wds,
+                                 size_t token_id) {
+      PROFILE("WhisperReplica::forward_step");
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      const Device device = _decoder->device();
+      _decoder->update_output_layer(_model->preferred_size_multiple());
+
+      StorageView ids({1}, int32_t(token_id), device);
+      StorageView logits(_decoder->output_type(), device);
+      (*_decoder)(wds.current_step, ids, wds.state, &logits);
+      wds.current_step++;
+
+      return logits;
+    }
+
+    StorageView
+    WhisperReplica::forward_batch(WhisperDecoderState& wds,
+                                  const std::vector<size_t>& token_ids) {
+      PROFILE("WhisperReplica::forward_batch");
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      const Device device = _decoder->device();
+      _decoder->update_output_layer(_model->preferred_size_multiple());
+
+      std::vector<std::vector<size_t>> batch = {token_ids};
+      const StorageView ids = layers::make_sequence_inputs(batch, device);
+
+      StorageView logits(_decoder->output_type(), device);
+      _decoder->forward_with_logits(ids, wds.current_step, wds.state, logits);
+      wds.current_step += static_cast<dim_t>(token_ids.size());
+
+      return logits;
+    }
+
+    void
+    WhisperDecoderState::truncate_to_step(dim_t target_step) {
+      if (target_step >= current_step)
+        return;
+      const dim_t steps_to_drop = current_step - target_step;
+      for (auto& [key, tensor] : state) {
+        if (key.compare(0, 10, "self_keys_") == 0
+            || key.compare(0, 12, "self_values_") == 0) {
+          const dim_t time_dim = 2;
+          const dim_t current_len = tensor.dim(time_dim);
+          const dim_t keep_len = current_len - steps_to_drop;
+          if (keep_len > 0 && keep_len < current_len) {
+            StorageView tmp(tensor.dtype(), tensor.device());
+            ops::Slide(time_dim, 0, keep_len)(tensor, tmp);
+            tensor = std::move(tmp);
+          }
+        }
+      }
+      current_step = target_step;
+    }
+
+    size_t
+    WhisperReplica::forward_step_greedy(WhisperDecoderState& wds,
+                                        size_t token_id) {
+      PROFILE("WhisperReplica::forward_step_greedy");
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      const Device device = _decoder->device();
+      _decoder->update_output_layer(_model->preferred_size_multiple());
+
+      StorageView ids({1}, int32_t(token_id), device);
+      StorageView logits(_decoder->output_type(), device);
+      (*_decoder)(wds.current_step, ids, wds.state, &logits);
+      wds.current_step++;
+
+      StorageView best_ids(DataType::INT32, device);
+      StorageView best_scores(logits.dtype(), device);
+      ops::TopK(1)(logits, best_scores, best_ids);
+
+      StorageView best_ids_cpu(DataType::INT32);
+      best_ids_cpu.copy_from(best_ids);
+      return static_cast<size_t>(best_ids_cpu.scalar_at<int32_t>({0, 0}));
+    }
+
+    std::vector<size_t>
+    WhisperReplica::forward_batch_greedy(WhisperDecoderState& wds,
+                                         const std::vector<size_t>& token_ids) {
+      PROFILE("WhisperReplica::forward_batch_greedy");
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      const Device device = _decoder->device();
+      _decoder->update_output_layer(_model->preferred_size_multiple());
+
+      std::vector<std::vector<size_t>> batch = {token_ids};
+      const StorageView ids = layers::make_sequence_inputs(batch, device);
+
+      StorageView logits(_decoder->output_type(), device);
+      _decoder->forward_with_logits(ids, wds.current_step, wds.state, logits);
+      wds.current_step += static_cast<dim_t>(token_ids.size());
+
+      StorageView best_ids(DataType::INT32, device);
+      StorageView best_scores(logits.dtype(), device);
+      ops::TopK(1)(logits, best_scores, best_ids);
+
+      StorageView best_ids_cpu(DataType::INT32);
+      best_ids_cpu.copy_from(best_ids);
+
+      const dim_t n = static_cast<dim_t>(token_ids.size());
+      std::vector<size_t> result(n);
+      for (dim_t i = 0; i < n; ++i)
+        result[i] = static_cast<size_t>(best_ids_cpu.at<int32_t>(i));
+      return result;
+    }
+
+
+    std::future<std::pair<WhisperDecoderState, StorageView>>
+    Whisper::prefill(const StorageView& features,
+                     std::vector<size_t> prompt) {
+      return post<std::pair<WhisperDecoderState, StorageView>>(
+        [features = features.sync_copy(),
+         prompt = std::move(prompt)]
+        (WhisperReplica& replica) mutable {
+          return replica.prefill(std::move(features), prompt);
+        });
+    }
+
+    std::future<StorageView>
+    Whisper::forward_step(WhisperDecoderState& state,
+                          size_t token_id) {
+      return post<StorageView>(
+        [&state, token_id]
+        (WhisperReplica& replica) mutable {
+          return replica.forward_step(state, token_id);
+        });
+    }
+
+    std::future<StorageView>
+    Whisper::forward_batch(WhisperDecoderState& state,
+                           std::vector<size_t> token_ids) {
+      return post<StorageView>(
+        [&state, token_ids = std::move(token_ids)]
+        (WhisperReplica& replica) mutable {
+          return replica.forward_batch(state, token_ids);
+        });
+    }
+
+    std::future<size_t>
+    Whisper::forward_step_greedy(WhisperDecoderState& state,
+                                 size_t token_id) {
+      return post<size_t>(
+        [&state, token_id]
+        (WhisperReplica& replica) mutable {
+          return replica.forward_step_greedy(state, token_id);
+        });
+    }
+
+    std::future<std::vector<size_t>>
+    Whisper::forward_batch_greedy(WhisperDecoderState& state,
+                                  std::vector<size_t> token_ids) {
+      return post<std::vector<size_t>>(
+        [&state, token_ids = std::move(token_ids)]
+        (WhisperReplica& replica) mutable {
+          return replica.forward_batch_greedy(state, token_ids);
+        });
     }
 
 

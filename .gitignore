@@ -10,3 +10,4 @@ python/dist/
 .cache
 docs/build/
 docs/python/
+*.so

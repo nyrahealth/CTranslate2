@@ -67,6 +67,11 @@ namespace ctranslate2 {
       void compute_logits_for_steps(const StorageView& outputs,
                                     const StorageView& steps,
                                     StorageView& logits);
+
+      void forward_with_logits(const StorageView& ids,
+                               dim_t step,
+                               DecoderState& state,
+                               StorageView& logits);
     };
 
   }

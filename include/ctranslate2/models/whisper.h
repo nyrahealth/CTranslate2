@@ -79,6 +79,25 @@ namespace ctranslate2 {
       std::vector<float> text_token_probs;
     };
 
+    struct WhisperDecoderState {
+      layers::DecoderState state;
+      dim_t current_step = 0;
+
+      WhisperDecoderState() = default;
+      WhisperDecoderState(WhisperDecoderState&&) = default;
+      WhisperDecoderState& operator=(WhisperDecoderState&&) = default;
+
+      WhisperDecoderState deep_copy() const {
+        WhisperDecoderState copy;
+        copy.current_step = current_step;
+        for (const auto& kv : state)
+          copy.state.emplace(kv.first, StorageView(kv.second));
+        return copy;
+      }
+
+      void truncate_to_step(dim_t target_step);
+    };
+
     class WhisperModel : public Model {
     public:
       const Vocabulary& get_vocabulary() const;
@@ -139,6 +158,22 @@ namespace ctranslate2 {
             std::vector<size_t> num_frames,
             dim_t median_filter_width);
 
+      std::pair<WhisperDecoderState, StorageView>
+      prefill(StorageView features,
+              const std::vector<size_t>& prompt);
+
+      StorageView forward_step(WhisperDecoderState& state,
+                               size_t token_id);
+
+      StorageView forward_batch(WhisperDecoderState& state,
+                                const std::vector<size_t>& token_ids);
+
+      size_t forward_step_greedy(WhisperDecoderState& state,
+                                 size_t token_id);
+
+      std::vector<size_t> forward_batch_greedy(WhisperDecoderState& state,
+                                               const std::vector<size_t>& token_ids);
+
     private:
       const std::shared_ptr<const WhisperModel> _model;
       const std::unique_ptr<layers::WhisperEncoder> _encoder;
@@ -184,6 +219,26 @@ namespace ctranslate2 {
             std::vector<std::vector<size_t>> text_tokens,
             std::vector<size_t> num_frames,
             dim_t median_filter_width);
+
+      std::future<std::pair<WhisperDecoderState, StorageView>>
+      prefill(const StorageView& features,
+              std::vector<size_t> prompt);
+
+      std::future<StorageView>
+      forward_step(WhisperDecoderState& state,
+                   size_t token_id);
+
+      std::future<StorageView>
+      forward_batch(WhisperDecoderState& state,
+                    std::vector<size_t> token_ids);
+
+      std::future<size_t>
+      forward_step_greedy(WhisperDecoderState& state,
+                          size_t token_id);
+
+      std::future<std::vector<size_t>>
+      forward_batch_greedy(WhisperDecoderState& state,
+                           std::vector<size_t> token_ids);
 
     };
 

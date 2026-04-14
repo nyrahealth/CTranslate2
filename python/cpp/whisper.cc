@@ -27,6 +27,45 @@ namespace ctranslate2 {
         return _pool->encode(features, to_cpu).get();
       }
 
+      std::pair<std::shared_ptr<models::WhisperDecoderState>, StorageView>
+      prefill(const StorageView& features, Ids prompt) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        auto result = _pool->prefill(features, std::move(prompt)).get();
+        auto state_ptr = std::make_shared<models::WhisperDecoderState>(
+            std::move(result.first));
+        return {state_ptr, std::move(result.second)};
+      }
+
+      StorageView forward_step(std::shared_ptr<models::WhisperDecoderState> state,
+                               size_t token_id) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        return _pool->forward_step(*state, token_id).get();
+      }
+
+      StorageView forward_batch(std::shared_ptr<models::WhisperDecoderState> state,
+                                Ids token_ids) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        return _pool->forward_batch(*state, std::move(token_ids)).get();
+      }
+
+      size_t forward_step_greedy(std::shared_ptr<models::WhisperDecoderState> state,
+                                 size_t token_id) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        return _pool->forward_step_greedy(*state, token_id).get();
+      }
+
+      std::vector<size_t> forward_batch_greedy(
+          std::shared_ptr<models::WhisperDecoderState> state,
+          Ids token_ids) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        return _pool->forward_batch_greedy(*state, std::move(token_ids)).get();
+      }
+
       std::variant<std::vector<models::WhisperGenerationResult>,
                    std::vector<AsyncResult<models::WhisperGenerationResult>>>
       generate(const StorageView& features,
@@ -115,6 +154,42 @@ namespace ctranslate2 {
 
 
     void register_whisper(py::module& m) {
+      py::class_<models::WhisperDecoderState, std::shared_ptr<models::WhisperDecoderState>>(
+        m, "WhisperDecoderState",
+        "Opaque container for Whisper decoder KV-cache state.")
+
+        .def_readonly("current_step", &models::WhisperDecoderState::current_step,
+                      "Number of tokens processed so far (prompt + generated).")
+
+        .def("clone", [](const models::WhisperDecoderState& self) {
+          return std::make_shared<models::WhisperDecoderState>(self.deep_copy());
+        },
+             py::call_guard<py::gil_scoped_release>(),
+             "Return a deep copy of this state (GPU tensors are duplicated).")
+
+        .def("truncate_to_step",
+             [](std::shared_ptr<models::WhisperDecoderState> self, int64_t target_step) {
+               self->truncate_to_step(static_cast<dim_t>(target_step));
+             },
+             py::arg("target_step"),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Truncate the KV cache to keep only the first ``target_step`` decode steps.
+
+                 Slices self-attention key/value tensors along the time dimension
+                 and resets the internal step counter.  Much cheaper than a full
+                 re-prefill when rolling back after a speculative decoding rejection.
+
+                 Arguments:
+                   target_step: Number of decode steps to retain.
+             )pbdoc")
+
+        .def("__repr__", [](const models::WhisperDecoderState& s) {
+          return "WhisperDecoderState(current_step=" + std::to_string(s.current_step)
+            + ", num_entries=" + std::to_string(s.state.size()) + ")";
+        })
+        ;
+
       py::class_<models::WhisperGenerationResult>(m, "WhisperGenerationResult",
                                                   "A generation result from the Whisper model.")
 
@@ -339,6 +414,101 @@ namespace ctranslate2 {
 
                  Returns:
                    A list of alignment results.
+             )pbdoc")
+
+        .def("prefill", &WhisperWrapper::prefill,
+             py::arg("features"),
+             py::arg("prompt"),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Encode features and prefill the decoder with a prompt.
+
+                 Processes the full prompt and returns a decoder state containing the
+                 KV-cache, plus logits for the first generation position.  Use this
+                 with :meth:`forward_step` and :meth:`forward_batch` for incremental
+                 decoding with KV-cache persistence.
+
+                 Arguments:
+                   features: Mel spectrogram with shape ``[1, n_mels, chunk_length]``
+                     or pre-encoded features from :meth:`encode`.
+                   prompt: Token IDs for the full decoder prompt.
+
+                 Returns:
+                   A tuple ``(state, logits)`` where ``state`` is a
+                   :class:`WhisperDecoderState` and ``logits`` has shape
+                   ``[1, vocab_size]``.
+             )pbdoc")
+
+        .def("forward_step", &WhisperWrapper::forward_step,
+             py::arg("state"),
+             py::arg("token_id"),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Run one decoder step with KV-cache reuse.
+
+                 Arguments:
+                   state: A :class:`WhisperDecoderState` (mutated in-place).
+                   token_id: The token ID to feed at the current step.
+
+                 Returns:
+                   Logits with shape ``[1, vocab_size]``.
+             )pbdoc")
+
+        .def("forward_batch", &WhisperWrapper::forward_batch,
+             py::arg("state"),
+             py::arg("token_ids"),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Process multiple tokens in parallel with KV-cache reuse.
+
+                 Extends the KV-cache with all provided tokens and returns
+                 logits at every position.  Useful for speculative decoding
+                 verification where the main model checks K draft tokens
+                 in a single forward pass.
+
+                 Arguments:
+                   state: A :class:`WhisperDecoderState` (mutated in-place).
+                   token_ids: List of token IDs to process.
+
+                 Returns:
+                   Logits with shape ``[1, num_tokens, vocab_size]``.
+             )pbdoc")
+
+        .def("forward_step_greedy", &WhisperWrapper::forward_step_greedy,
+             py::arg("state"),
+             py::arg("token_id"),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Run one decoder step and return the greedy (argmax) token ID.
+
+                 Like :meth:`forward_step` but performs TopK(1) on the GPU and
+                 returns a single integer instead of the full logits tensor.
+                 Avoids the large GPU-to-CPU transfer of the vocabulary logits.
+
+                 Arguments:
+                   state: A :class:`WhisperDecoderState` (mutated in-place).
+                   token_id: The token ID to feed at the current step.
+
+                 Returns:
+                   The greedy next-token ID.
+             )pbdoc")
+
+        .def("forward_batch_greedy", &WhisperWrapper::forward_batch_greedy,
+             py::arg("state"),
+             py::arg("token_ids"),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Process multiple tokens and return greedy predictions at each position.
+
+                 Like :meth:`forward_batch` but performs TopK(1) on the GPU and
+                 returns a list of token IDs instead of the full logits tensor.
+
+                 Arguments:
+                   state: A :class:`WhisperDecoderState` (mutated in-place).
+                   token_ids: List of token IDs to process.
+
+                 Returns:
+                   List of greedy next-token IDs (one per input position).
              )pbdoc")
 
         .def("unload_model", &WhisperWrapper::unload_model,
