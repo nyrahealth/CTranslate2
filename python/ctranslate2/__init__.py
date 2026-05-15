@@ -38,6 +38,7 @@ try:
         StorageView,
         TranslationResult,
         Translator,
+        WhisperDecoderState,
         contains_model,
         get_cuda_device_count,
         get_supported_compute_types,
