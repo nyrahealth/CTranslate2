@@ -66,6 +66,42 @@ namespace ctranslate2 {
         return _pool->forward_batch_greedy(*state, std::move(token_ids)).get();
       }
 
+      void set_alignment_heads(const std::vector<std::pair<int64_t, int64_t>>& heads) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        std::vector<std::pair<dim_t, dim_t>> dim_heads;
+        dim_heads.reserve(heads.size());
+        for (const auto& [layer, head] : heads)
+          dim_heads.emplace_back(static_cast<dim_t>(layer), static_cast<dim_t>(head));
+        _pool->set_alignment_heads(std::move(dim_heads));
+      }
+
+      std::tuple<std::shared_ptr<models::WhisperDecoderState>, StorageView, StorageView>
+      prefill_with_attention(const StorageView& features, Ids prompt) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        auto result = _pool->prefill_with_attention(features, std::move(prompt)).get();
+        auto state_ptr = std::make_shared<models::WhisperDecoderState>(
+            std::move(std::get<0>(result)));
+        return {state_ptr, std::move(std::get<1>(result)), std::move(std::get<2>(result))};
+      }
+
+      std::pair<StorageView, StorageView>
+      forward_step_with_attention(std::shared_ptr<models::WhisperDecoderState> state,
+                                  size_t token_id) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        return _pool->forward_step_with_attention(*state, token_id).get();
+      }
+
+      std::pair<size_t, StorageView>
+      forward_step_greedy_with_attention(std::shared_ptr<models::WhisperDecoderState> state,
+                                         size_t token_id) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        return _pool->forward_step_greedy_with_attention(*state, token_id).get();
+      }
+
       std::variant<std::vector<models::WhisperGenerationResult>,
                    std::vector<AsyncResult<models::WhisperGenerationResult>>>
       generate(const StorageView& features,
@@ -176,17 +212,41 @@ namespace ctranslate2 {
              R"pbdoc(
                  Truncate the KV cache to keep only the first ``target_step`` decode steps.
 
-                 Slices self-attention key/value tensors along the time dimension
-                 and resets the internal step counter.  Much cheaper than a full
-                 re-prefill when rolling back after a speculative decoding rejection.
+                 Slices self-attention key/value tensors along the time dimension,
+                 trims the collected cross-attention buffer to match, and resets
+                 the internal step counter.  Much cheaper than a full re-prefill
+                 when rolling back after a speculative-decoding rejection or a
+                 hallucination-repair rewind.
 
                  Arguments:
                    target_step: Number of decode steps to retain.
              )pbdoc")
 
+        .def_property_readonly(
+            "collected_attention",
+            [](const models::WhisperDecoderState& self) {
+              return self.collected_attention;
+            },
+            R"pbdoc(
+                Per-step cross-attention rows captured by the ``*_with_attention``
+                APIs.
+
+                Each entry is a :class:`StorageView` of shape
+                ``[1, num_selected_heads, F_enc]`` (post-softmax — each
+                ``(batch, head, :)`` row sums to 1 over encoder frames).  Index
+                ``k`` corresponds to the attention emitted while predicting the
+                ``k``-th newly-generated token (i.e. the row associated with
+                that token's identity).
+
+                The list is empty if attention extraction was never enabled or
+                if it has been truncated all the way back by
+                :meth:`truncate_to_step`.
+            )pbdoc")
+
         .def("__repr__", [](const models::WhisperDecoderState& s) {
           return "WhisperDecoderState(current_step=" + std::to_string(s.current_step)
-            + ", num_entries=" + std::to_string(s.state.size()) + ")";
+            + ", num_entries=" + std::to_string(s.state.size())
+            + ", attention_steps=" + std::to_string(s.collected_attention.size()) + ")";
         })
         ;
 
@@ -509,6 +569,84 @@ namespace ctranslate2 {
 
                  Returns:
                    List of greedy next-token IDs (one per input position).
+             )pbdoc")
+
+        .def("set_alignment_heads", &WhisperWrapper::set_alignment_heads,
+             py::arg("heads"),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Configure which cross-attention heads to collect when the
+                 ``*_with_attention`` APIs are used.
+
+                 The same heads are applied to whichever pool replica handles
+                 each request, so this works with multi-replica pools.  Pass an
+                 empty list to disable collection.
+
+                 Enabling a non-empty selection also switches the decoder to
+                 emit **post-softmax** cross-attention (rows that sum to 1 over
+                 encoder frames), which is what timing extractors like
+                 ``viterbi_align_words_with_blanks`` expect.
+
+                 Arguments:
+                   heads: List of ``(layer_index, head_index)`` pairs.
+             )pbdoc")
+
+        .def("prefill_with_attention", &WhisperWrapper::prefill_with_attention,
+             py::arg("features"),
+             py::arg("prompt"),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Like :meth:`prefill`, but also returns the cross-attention row
+                 for the first generation position and appends it to
+                 ``state.collected_attention``.
+
+                 Arguments:
+                   features: Mel spectrogram with shape ``[1, n_mels, chunk_length]``
+                     or pre-encoded features from :meth:`encode`.
+                   prompt: Token IDs for the full decoder prompt.
+
+                 Returns:
+                   A tuple ``(state, logits, attention)`` where ``attention`` has
+                   shape ``[1, num_selected_heads, F_enc]``.
+             )pbdoc")
+
+        .def("forward_step_with_attention", &WhisperWrapper::forward_step_with_attention,
+             py::arg("state"),
+             py::arg("token_id"),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Like :meth:`forward_step`, but also returns the cross-attention
+                 row for this step and appends it to ``state.collected_attention``.
+
+                 Arguments:
+                   state: A :class:`WhisperDecoderState` (mutated in-place).
+                   token_id: The token ID to feed at the current step.
+
+                 Returns:
+                   A tuple ``(logits, attention)`` with shapes
+                   ``[1, vocab_size]`` and ``[1, num_selected_heads, F_enc]``.
+             )pbdoc")
+
+        .def("forward_step_greedy_with_attention",
+             &WhisperWrapper::forward_step_greedy_with_attention,
+             py::arg("state"),
+             py::arg("token_id"),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Like :meth:`forward_step_greedy`, but also returns the
+                 cross-attention row for this step and appends it to
+                 ``state.collected_attention``.
+
+                 Argmax stays on the GPU; only the attention row and the picked
+                 token id leave the device.
+
+                 Arguments:
+                   state: A :class:`WhisperDecoderState` (mutated in-place).
+                   token_id: The token ID to feed at the current step.
+
+                 Returns:
+                   A tuple ``(picked_token_id, attention)`` where ``attention``
+                   has shape ``[1, num_selected_heads, F_enc]``.
              )pbdoc")
 
         .def("unload_model", &WhisperWrapper::unload_model,

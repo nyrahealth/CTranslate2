@@ -1,5 +1,9 @@
 #pragma once
 
+#include <mutex>
+#include <tuple>
+#include <utility>
+
 #include "ctranslate2/generation.h"
 #include "ctranslate2/layers/whisper.h"
 #include "ctranslate2/models/model.h"
@@ -82,6 +86,15 @@ namespace ctranslate2 {
     struct WhisperDecoderState {
       layers::DecoderState state;
       dim_t current_step = 0;
+      // Per-step cross-attention rows captured during incremental
+      // decoding.  Each entry has shape ``[1, num_selected_heads,
+      // F_enc]`` (post-softmax, so each (batch, head, :) row sums to 1
+      // over encoder frames) and lives on the model's device.
+      // Populated only by the ``*_with_attention`` APIs.  Index ``k``
+      // corresponds to the attention emitted when predicting the
+      // (prompt_len+k)-th token, i.e. the row matching the k-th
+      // generated token (0-indexed).
+      std::vector<StorageView> collected_attention;
 
       WhisperDecoderState() = default;
       WhisperDecoderState(WhisperDecoderState&&) = default;
@@ -92,6 +105,9 @@ namespace ctranslate2 {
         copy.current_step = current_step;
         for (const auto& kv : state)
           copy.state.emplace(kv.first, StorageView(kv.second));
+        copy.collected_attention.reserve(collected_attention.size());
+        for (const auto& a : collected_attention)
+          copy.collected_attention.emplace_back(a);
         return copy;
       }
 
@@ -174,6 +190,35 @@ namespace ctranslate2 {
       std::vector<size_t> forward_batch_greedy(WhisperDecoderState& state,
                                                const std::vector<size_t>& token_ids);
 
+      // Configure which (layer, head) cross-attention rows to collect on
+      // subsequent ``*_with_attention`` calls.  Also enables post-softmax
+      // attention output on the decoder.  Pass an empty list to disable
+      // collection (and revert the decoder to its default raw-attention
+      // mode used by ``align()``).
+      void set_alignment_heads(const std::vector<std::pair<dim_t, dim_t>>& heads);
+
+      // Like ``prefill`` but also returns the post-softmax cross-attention
+      // row at the first generation position (i.e. the attention emitted
+      // when the last prompt token is fed and the model predicts the
+      // first new token).  The row is also appended to
+      // ``state.collected_attention``.
+      std::tuple<WhisperDecoderState, StorageView, StorageView>
+      prefill_with_attention(StorageView features,
+                             const std::vector<size_t>& prompt);
+
+      // Like ``forward_step`` but also returns the cross-attention row
+      // for this step and appends it to ``state.collected_attention``.
+      std::pair<StorageView, StorageView>
+      forward_step_with_attention(WhisperDecoderState& state,
+                                  size_t token_id);
+
+      // Like ``forward_step_greedy`` but also captures the cross-attention
+      // row.  The greedy argmax stays on the GPU; only the (small)
+      // attention row plus the picked token id leave the device.
+      std::pair<size_t, StorageView>
+      forward_step_greedy_with_attention(WhisperDecoderState& state,
+                                         size_t token_id);
+
     private:
       const std::shared_ptr<const WhisperModel> _model;
       const std::unique_ptr<layers::WhisperEncoder> _encoder;
@@ -240,6 +285,30 @@ namespace ctranslate2 {
       forward_batch_greedy(WhisperDecoderState& state,
                            std::vector<size_t> token_ids);
 
+      // Configure the (layer, head) cross-attention rows to collect on
+      // subsequent ``*_with_attention`` calls.  The configuration is
+      // stored on the pool and re-applied to whichever replica handles
+      // each request, so it works correctly with multiple replicas.
+      // Pass an empty vector to disable collection.
+      void set_alignment_heads(std::vector<std::pair<dim_t, dim_t>> heads);
+
+      std::future<std::tuple<WhisperDecoderState, StorageView, StorageView>>
+      prefill_with_attention(const StorageView& features,
+                             std::vector<size_t> prompt);
+
+      std::future<std::pair<StorageView, StorageView>>
+      forward_step_with_attention(WhisperDecoderState& state,
+                                  size_t token_id);
+
+      std::future<std::pair<size_t, StorageView>>
+      forward_step_greedy_with_attention(WhisperDecoderState& state,
+                                         size_t token_id);
+
+    private:
+      std::vector<std::pair<dim_t, dim_t>> _alignment_heads;
+      mutable std::mutex _alignment_heads_mutex;
+
+      std::vector<std::pair<dim_t, dim_t>> get_alignment_heads_copy() const;
     };
 
   }

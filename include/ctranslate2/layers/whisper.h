@@ -57,7 +57,16 @@ namespace ctranslate2 {
       using TransformerDecoder::TransformerDecoder;
 
       bool return_normalized_attention() const override {
-        return false;
+        return _return_normalized_attention;
+      }
+
+      // When ``true``, the ``attention`` output captured by the decoder
+      // contains **post-softmax** cross-attention probabilities (rows sum
+      // to 1 over encoder frames).  When ``false`` (the default, kept for
+      // backwards compatibility with ``align()``'s DTW path), it contains
+      // the raw pre-softmax scores.
+      void set_return_normalized_attention(bool v) {
+        _return_normalized_attention = v;
       }
 
       void forward_prompt(const StorageView& prompt,
@@ -72,6 +81,9 @@ namespace ctranslate2 {
                                dim_t step,
                                DecoderState& state,
                                StorageView& logits);
+
+    private:
+      bool _return_normalized_attention = false;
     };
 
   }

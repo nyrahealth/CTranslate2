@@ -448,6 +448,10 @@ namespace ctranslate2 {
                                  "of ctranslate2.");
 
       _decoder->set_alignment_heads(alignment_heads->get<std::vector<std::pair<dim_t, dim_t>>>());
+      // ``align()`` expects raw pre-softmax cross-attention scores so it
+      // can median-filter and softmax them itself.  Reset the flag here
+      // in case a previous ``*_with_attention`` call set it to true.
+      _decoder->set_return_normalized_attention(false);
 
       std::vector<std::vector<size_t>> input_tokens;
       std::vector<std::vector<size_t>> output_tokens;
@@ -831,6 +835,17 @@ namespace ctranslate2 {
           }
         }
       }
+      // Keep the cross-attention buffer aligned with the kept tokens.
+      // collected_attention[k] corresponds to predicting the (start+k)-th
+      // newly-generated token, so we resize from the right.
+      if (!collected_attention.empty()) {
+        const dim_t kept = static_cast<dim_t>(collected_attention.size())
+                           - steps_to_drop;
+        if (kept <= 0)
+          collected_attention.clear();
+        else
+          collected_attention.resize(static_cast<size_t>(kept));
+      }
       current_step = target_step;
     }
 
@@ -895,6 +910,145 @@ namespace ctranslate2 {
       return result;
     }
 
+    // -----------------------------------------------------------------------
+    // Cross-attention extraction for word timings (used by CrisperWhisper).
+    //
+    // ``set_alignment_heads`` selects a fixed list of (layer, head) pairs
+    // that the decoder will gather and concatenate into the ``attention``
+    // output of every subsequent decode step.  ``*_with_attention``
+    // variants of ``prefill`` / ``forward_step`` / ``forward_step_greedy``
+    // capture that per-step row into ``state.collected_attention`` so the
+    // caller can do a single bulk GPU->CPU transfer at the end of a
+    // generation run.
+    //
+    // The selected heads are post-softmax cross-attention probabilities
+    // (rows sum to 1 over encoder frames), which is what
+    // CrisperWhisper-style Viterbi/peak-mass timing extractors expect.
+    // -----------------------------------------------------------------------
+
+    void
+    WhisperReplica::set_alignment_heads(
+        const std::vector<std::pair<dim_t, dim_t>>& heads) {
+      _decoder->set_alignment_heads(heads);
+      // Empty list disables collection; in that case keep the decoder in
+      // its default raw-attention mode (used by ``align()``).  Otherwise
+      // request post-softmax rows so timing extractors get probability
+      // distributions over encoder frames.
+      _decoder->set_return_normalized_attention(!heads.empty());
+    }
+
+    static void require_alignment_heads_configured(const layers::WhisperDecoder& dec) {
+      // ``decode()`` only populates the ``attention`` output when at
+      // least one ``(layer, head)`` pair is configured.  Catch the
+      // common mistake of calling ``*_with_attention`` before
+      // ``set_alignment_heads`` and give a useful error message.
+      if (!dec.return_normalized_attention())
+        throw std::runtime_error(
+            "WhisperReplica: no alignment heads configured for "
+            "*_with_attention(); call set_alignment_heads([...]) first.");
+    }
+
+    std::tuple<WhisperDecoderState, StorageView, StorageView>
+    WhisperReplica::prefill_with_attention(StorageView features,
+                                           const std::vector<size_t>& prompt) {
+      PROFILE("WhisperReplica::prefill_with_attention");
+      require_alignment_heads_configured(*_decoder);
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      const Device device = _decoder->device();
+
+      layers::DecoderState state = _decoder->initial_state();
+      state.emplace("memory", maybe_encode(std::move(features)));
+      _decoder->update_output_layer(_model->preferred_size_multiple());
+
+      if (prompt.size() > 1) {
+        std::vector<std::vector<size_t>> prompt_batch = {
+          std::vector<size_t>(prompt.begin(), prompt.end() - 1)
+        };
+        const StorageView inputs = layers::make_sequence_inputs(prompt_batch, device);
+        // We discard the prompt's per-step attention here: those rows
+        // correspond to prompt tokens, not to generated tokens.
+        _decoder->forward_prompt(inputs, state);
+      }
+
+      const dim_t start_step = prompt.size() > 1
+          ? static_cast<dim_t>(prompt.size()) - 1
+          : 0;
+
+      StorageView last_id({1}, int32_t(prompt.back()), device);
+      StorageView logits(_decoder->output_type(), device);
+      StorageView attention(_decoder->output_type(), device);
+      (*_decoder)(start_step, last_id, state, &logits, &attention);
+
+      WhisperDecoderState wds;
+      wds.state = std::move(state);
+      wds.current_step = static_cast<dim_t>(prompt.size());
+      // The attention row at this step corresponds to predicting the
+      // first new (generated) token: append it to the buffer.
+      wds.collected_attention.emplace_back(attention);
+
+      return {std::move(wds), std::move(logits), std::move(attention)};
+    }
+
+    std::pair<StorageView, StorageView>
+    WhisperReplica::forward_step_with_attention(WhisperDecoderState& wds,
+                                                size_t token_id) {
+      PROFILE("WhisperReplica::forward_step_with_attention");
+      require_alignment_heads_configured(*_decoder);
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      const Device device = _decoder->device();
+      _decoder->update_output_layer(_model->preferred_size_multiple());
+
+      StorageView ids({1}, int32_t(token_id), device);
+      StorageView logits(_decoder->output_type(), device);
+      StorageView attention(_decoder->output_type(), device);
+      (*_decoder)(wds.current_step, ids, wds.state, &logits, &attention);
+      wds.current_step++;
+      wds.collected_attention.emplace_back(attention);
+
+      return {std::move(logits), std::move(attention)};
+    }
+
+    std::pair<size_t, StorageView>
+    WhisperReplica::forward_step_greedy_with_attention(WhisperDecoderState& wds,
+                                                       size_t token_id) {
+      PROFILE("WhisperReplica::forward_step_greedy_with_attention");
+      require_alignment_heads_configured(*_decoder);
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      const Device device = _decoder->device();
+      _decoder->update_output_layer(_model->preferred_size_multiple());
+
+      StorageView ids({1}, int32_t(token_id), device);
+      StorageView logits(_decoder->output_type(), device);
+      StorageView attention(_decoder->output_type(), device);
+      (*_decoder)(wds.current_step, ids, wds.state, &logits, &attention);
+      wds.current_step++;
+      wds.collected_attention.emplace_back(attention);
+
+      StorageView best_ids(DataType::INT32, device);
+      StorageView best_scores(logits.dtype(), device);
+      ops::TopK(1)(logits, best_scores, best_ids);
+
+      StorageView best_ids_cpu(DataType::INT32);
+      best_ids_cpu.copy_from(best_ids);
+      const size_t picked = static_cast<size_t>(best_ids_cpu.scalar_at<int32_t>({0, 0}));
+      return {picked, std::move(attention)};
+    }
+
 
     std::future<std::pair<WhisperDecoderState, StorageView>>
     Whisper::prefill(const StorageView& features,
@@ -944,6 +1098,56 @@ namespace ctranslate2 {
         [&state, token_ids = std::move(token_ids)]
         (WhisperReplica& replica) mutable {
           return replica.forward_batch_greedy(state, token_ids);
+        });
+    }
+
+    void
+    Whisper::set_alignment_heads(std::vector<std::pair<dim_t, dim_t>> heads) {
+      std::lock_guard<std::mutex> lock(_alignment_heads_mutex);
+      _alignment_heads = std::move(heads);
+    }
+
+    std::vector<std::pair<dim_t, dim_t>>
+    Whisper::get_alignment_heads_copy() const {
+      std::lock_guard<std::mutex> lock(_alignment_heads_mutex);
+      return _alignment_heads;
+    }
+
+    std::future<std::tuple<WhisperDecoderState, StorageView, StorageView>>
+    Whisper::prefill_with_attention(const StorageView& features,
+                                    std::vector<size_t> prompt) {
+      auto heads = get_alignment_heads_copy();
+      return post<std::tuple<WhisperDecoderState, StorageView, StorageView>>(
+        [features = features.sync_copy(),
+         prompt = std::move(prompt),
+         heads = std::move(heads)]
+        (WhisperReplica& replica) mutable {
+          replica.set_alignment_heads(heads);
+          return replica.prefill_with_attention(std::move(features), prompt);
+        });
+    }
+
+    std::future<std::pair<StorageView, StorageView>>
+    Whisper::forward_step_with_attention(WhisperDecoderState& state,
+                                         size_t token_id) {
+      auto heads = get_alignment_heads_copy();
+      return post<std::pair<StorageView, StorageView>>(
+        [&state, token_id, heads = std::move(heads)]
+        (WhisperReplica& replica) mutable {
+          replica.set_alignment_heads(heads);
+          return replica.forward_step_with_attention(state, token_id);
+        });
+    }
+
+    std::future<std::pair<size_t, StorageView>>
+    Whisper::forward_step_greedy_with_attention(WhisperDecoderState& state,
+                                                size_t token_id) {
+      auto heads = get_alignment_heads_copy();
+      return post<std::pair<size_t, StorageView>>(
+        [&state, token_id, heads = std::move(heads)]
+        (WhisperReplica& replica) mutable {
+          replica.set_alignment_heads(heads);
+          return replica.forward_step_greedy_with_attention(state, token_id);
         });
     }
 
