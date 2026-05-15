@@ -3,6 +3,8 @@
 #include <algorithm>
 
 #include "ctranslate2/decoding.h"
+#include "ctranslate2/ops/concat.h"
+#include "ctranslate2/ops/mean.h"
 #include "ctranslate2/ops/topk.h"
 #include "ctranslate2/ops/slide.h"
 
@@ -1049,6 +1051,149 @@ namespace ctranslate2 {
       return {picked, std::move(attention)};
     }
 
+    std::pair<WhisperDecoderState, std::vector<size_t>>
+    WhisperReplica::generate_greedy_with_attention(
+        StorageView features,
+        const std::vector<size_t>& prompt,
+        size_t max_new_tokens,
+        size_t eot_id,
+        const std::vector<size_t>& suppress_tokens,
+        const std::vector<size_t>& ban_first_tokens) {
+      PROFILE("WhisperReplica::generate_greedy_with_attention");
+      require_alignment_heads_configured(*_decoder);
+
+      if (prompt.empty())
+        throw std::invalid_argument(
+            "generate_greedy_with_attention: prompt must be non-empty");
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      const Device device = _decoder->device();
+
+      layers::DecoderState state = _decoder->initial_state();
+      state.emplace("memory", maybe_encode(std::move(features)));
+      _decoder->update_output_layer(_model->preferred_size_multiple());
+
+      // Prefill all but the last prompt token; the last one drives the
+      // first generation step (where we want attention + logits).
+      if (prompt.size() > 1) {
+        std::vector<std::vector<size_t>> prompt_batch = {
+          std::vector<size_t>(prompt.begin(), prompt.end() - 1)
+        };
+        const StorageView inputs = layers::make_sequence_inputs(prompt_batch, device);
+        _decoder->forward_prompt(inputs, state);
+      }
+
+      WhisperDecoderState wds;
+      wds.state = std::move(state);
+      wds.current_step = prompt.size() > 1
+          ? static_cast<dim_t>(prompt.size()) - 1
+          : 0;
+      wds.collected_attention.reserve(max_new_tokens);
+
+      std::vector<size_t> generated;
+      generated.reserve(max_new_tokens);
+
+      size_t cur_token = prompt.back();
+
+      for (size_t step = 0; step < max_new_tokens; ++step) {
+        StorageView ids({1}, int32_t(cur_token), device);
+        StorageView logits(_decoder->output_type(), device);
+        StorageView attention(_decoder->output_type(), device);
+        (*_decoder)(wds.current_step, ids, wds.state, &logits, &attention);
+        wds.current_step++;
+        wds.collected_attention.emplace_back(std::move(attention));
+
+        // Mask suppressed tokens (and the loop-starting "ban" tokens on
+        // step 0 only) directly on the device before argmax.
+        {
+          DisableTokens disable(logits);
+          for (const size_t tid : suppress_tokens)
+            disable.add(static_cast<dim_t>(tid));
+          if (step == 0) {
+            for (const size_t tid : ban_first_tokens)
+              disable.add(static_cast<dim_t>(tid));
+          }
+          disable.apply();
+        }
+
+        StorageView best_ids(DataType::INT32, device);
+        StorageView best_scores(logits.dtype(), device);
+        ops::TopK(1)(logits, best_scores, best_ids);
+
+        StorageView best_ids_cpu(DataType::INT32);
+        best_ids_cpu.copy_from(best_ids);
+        const size_t picked = static_cast<size_t>(
+            best_ids_cpu.scalar_at<int32_t>({0, 0}));
+
+        generated.push_back(picked);
+        if (picked == eot_id)
+          break;
+        cur_token = picked;
+      }
+
+      return {std::move(wds), std::move(generated)};
+    }
+
+    StorageView
+    WhisperReplica::collected_attention_to_cpu(const WhisperDecoderState& state,
+                                               bool average_heads) const {
+      PROFILE("WhisperReplica::collected_attention_to_cpu");
+      const auto& rows = state.collected_attention;
+      if (rows.empty())
+        return StorageView();
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      const Device device = _decoder->device();
+      const DataType dtype = rows.front().dtype();
+
+      // ``Concat`` requires pointers to all inputs.  Each row has shape
+      // ``[1, num_heads, F_enc]``, so concatenating along axis 0 yields
+      // ``[T, num_heads, F_enc]`` -- the natural per-step stacking.
+      std::vector<const StorageView*> ptrs;
+      ptrs.reserve(rows.size());
+      for (const auto& row : rows)
+        ptrs.push_back(&row);
+
+      StorageView stacked(dtype, device);
+      ops::Concat(/*axis=*/0)(ptrs, stacked);
+
+      // Optional head-mean -> [T, F_enc].
+      StorageView reduced(dtype, device);
+      if (average_heads) {
+        // Mean over axis=1 (the num_heads axis).  ``ops::Mean`` keeps
+        // dims but writes the reduced shape, so the result is
+        // ``[T, 1, F_enc]``; we drop the singleton dim below.
+        ops::Mean(/*axis=*/1)(stacked, reduced);
+      } else {
+        reduced = std::move(stacked);
+      }
+
+      // Cast to float32 on the device (Python timing code expects fp32).
+      StorageView fp32(DataType::FLOAT32, device);
+      if (reduced.dtype() == DataType::FLOAT32)
+        fp32 = std::move(reduced);
+      else
+        fp32 = reduced.to(DataType::FLOAT32);
+
+      // Single bulk PCIe transfer to CPU.
+      StorageView cpu = fp32.to(Device::CPU);
+
+      // Squeeze the singleton ``num_heads`` axis when averaging so the
+      // Python side gets a clean ``[T, F_enc]`` array.
+      if (average_heads && cpu.rank() == 3 && cpu.dim(1) == 1)
+        cpu.squeeze(1);
+
+      return cpu;
+    }
+
 
     std::future<std::pair<WhisperDecoderState, StorageView>>
     Whisper::prefill(const StorageView& features,
@@ -1148,6 +1293,45 @@ namespace ctranslate2 {
         (WhisperReplica& replica) mutable {
           replica.set_alignment_heads(heads);
           return replica.forward_step_greedy_with_attention(state, token_id);
+        });
+    }
+
+    std::future<StorageView>
+    Whisper::collected_attention_to_cpu(const WhisperDecoderState& state,
+                                        bool average_heads) {
+      return post<StorageView>(
+        [&state, average_heads]
+        (WhisperReplica& replica) mutable {
+          return replica.collected_attention_to_cpu(state, average_heads);
+        });
+    }
+
+    std::future<std::pair<WhisperDecoderState, std::vector<size_t>>>
+    Whisper::generate_greedy_with_attention(
+        StorageView features,
+        std::vector<size_t> prompt,
+        size_t max_new_tokens,
+        size_t eot_id,
+        std::vector<size_t> suppress_tokens,
+        std::vector<size_t> ban_first_tokens) {
+      auto heads = get_alignment_heads_copy();
+      return post<std::pair<WhisperDecoderState, std::vector<size_t>>>(
+        [features = features.sync_copy(),
+         prompt = std::move(prompt),
+         max_new_tokens,
+         eot_id,
+         suppress_tokens = std::move(suppress_tokens),
+         ban_first_tokens = std::move(ban_first_tokens),
+         heads = std::move(heads)]
+        (WhisperReplica& replica) mutable {
+          replica.set_alignment_heads(heads);
+          return replica.generate_greedy_with_attention(
+              std::move(features),
+              prompt,
+              max_new_tokens,
+              eot_id,
+              suppress_tokens,
+              ban_first_tokens);
         });
     }
 

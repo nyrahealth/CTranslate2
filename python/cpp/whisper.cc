@@ -102,6 +102,35 @@ namespace ctranslate2 {
         return _pool->forward_step_greedy_with_attention(*state, token_id).get();
       }
 
+      StorageView
+      collected_attention_to_cpu(std::shared_ptr<models::WhisperDecoderState> state,
+                                 bool average_heads) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        return _pool->collected_attention_to_cpu(*state, average_heads).get();
+      }
+
+      std::pair<std::shared_ptr<models::WhisperDecoderState>, std::vector<size_t>>
+      generate_greedy_with_attention(const StorageView& features,
+                                     Ids prompt,
+                                     size_t max_new_tokens,
+                                     size_t eot_id,
+                                     std::vector<size_t> suppress_tokens,
+                                     std::vector<size_t> ban_first_tokens) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        auto result = _pool->generate_greedy_with_attention(
+            features,
+            std::move(prompt),
+            max_new_tokens,
+            eot_id,
+            std::move(suppress_tokens),
+            std::move(ban_first_tokens)).get();
+        auto state_ptr = std::make_shared<models::WhisperDecoderState>(
+            std::move(result.first));
+        return {state_ptr, std::move(result.second)};
+      }
+
       std::variant<std::vector<models::WhisperGenerationResult>,
                    std::vector<AsyncResult<models::WhisperGenerationResult>>>
       generate(const StorageView& features,
@@ -647,6 +676,84 @@ namespace ctranslate2 {
                  Returns:
                    A tuple ``(picked_token_id, attention)`` where ``attention``
                    has shape ``[1, num_selected_heads, F_enc]``.
+             )pbdoc")
+
+        .def("collected_attention_to_cpu",
+             &WhisperWrapper::collected_attention_to_cpu,
+             py::arg("state"),
+             py::arg("average_heads") = true,
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Bulk-transfer ``state.collected_attention`` to CPU as a
+                 single :class:`StorageView`.
+
+                 Internally concatenates every captured per-step attention
+                 row along the time axis **on the device** (one
+                 ``ops::Concat`` call), optionally averages over the
+                 selected heads, casts to float32, and copies the result
+                 to CPU in a single PCIe transfer.  Much faster than
+                 doing one transfer per step when many tokens were
+                 generated.
+
+                 Arguments:
+                   state: A :class:`WhisperDecoderState` (not mutated).
+                   average_heads: If True (default), mean over the
+                     selected heads and return a ``[T, F_enc]`` tensor.
+                     Otherwise return ``[T, num_heads, F_enc]``.
+
+                 Returns:
+                   A CPU :class:`StorageView`; empty if no attention rows
+                   were captured.
+             )pbdoc")
+
+        .def("generate_greedy_with_attention",
+             &WhisperWrapper::generate_greedy_with_attention,
+             py::arg("features"),
+             py::arg("prompt"),
+             py::kw_only(),
+             py::arg("max_new_tokens"),
+             py::arg("eot_id"),
+             py::arg("suppress_tokens") = std::vector<size_t>{},
+             py::arg("ban_first_tokens") = std::vector<size_t>{},
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Run a full greedy decode segment with per-step cross-attention
+                 capture, **entirely inside one CTranslate2 thread-pool job**.
+
+                 This is the fast path used by CrisperWhisper's word-timing
+                 pipeline.  Doing the whole loop in C++ avoids the
+                 Python-to-C++ dispatch (and GPU-to-CPU logits copy) that the
+                 per-step ``forward_step_greedy_with_attention`` API would incur
+                 once per token.
+
+                 Token suppression and the loop-starting "ban" tokens are
+                 applied on the device before argmax, so logits never leave
+                 the GPU on the hot path.
+
+                 Arguments:
+                   features: Mel spectrogram with shape ``[1, n_mels, chunk_length]``
+                     or pre-encoded features from :meth:`encode`.
+                   prompt: Token IDs for the full decoder prompt.  Decoding
+                     starts with the **last** prompt token; everything before
+                     it is consumed by an internal prefill that does not
+                     contribute to ``collected_attention``.
+                   max_new_tokens: Hard cap on how many tokens to generate
+                     before stopping (regardless of EOT).
+                   eot_id: End-of-text token id.  Decoding stops as soon as
+                     this id is emitted (it is included in the returned
+                     sequence).
+                   suppress_tokens: Token ids to mask out at **every** step.
+                   ban_first_tokens: Token ids to mask out **only at the very
+                     first** generated step.  Used by hallucination-repair to
+                     force the model away from the loop-starting token.
+
+                 Returns:
+                   A tuple ``(state, generated)``.  ``state`` is the new
+                   :class:`WhisperDecoderState` with ``current_step`` and
+                   ``collected_attention`` updated.  ``generated`` is the list
+                   of newly emitted token ids, of length
+                   ``len(state.collected_attention)``; the final element will
+                   equal ``eot_id`` when generation stopped on EOT.
              )pbdoc")
 
         .def("unload_model", &WhisperWrapper::unload_model,

@@ -219,6 +219,42 @@ namespace ctranslate2 {
       forward_step_greedy_with_attention(WhisperDecoderState& state,
                                          size_t token_id);
 
+      // Concatenate ``state.collected_attention`` along the time axis,
+      // optionally average over the heads dimension, cast to float32,
+      // and transfer the result to CPU in a single bulk PCIe copy.
+      //
+      // Output shape:
+      //   * ``average_heads = true``  -> ``[T, F_enc]``
+      //   * ``average_heads = false`` -> ``[T, num_heads, F_enc]``
+      //
+      // Returns an empty StorageView (size 0) when no rows are buffered.
+      // ``state`` is not mutated.
+      StorageView collected_attention_to_cpu(const WhisperDecoderState& state,
+                                             bool average_heads = true) const;
+
+      // Runs a full greedy decode loop with on-GPU argmax and per-step
+      // cross-attention capture, all inside a single thread-pool job
+      // (no Python round-trip per step).  Used by CrisperWhisper's
+      // word-timing pipeline to avoid the dispatch / logits-to-CPU
+      // overhead of doing the same thing from Python.
+      //
+      // ``suppress_tokens`` are masked at every step.
+      // ``ban_first_tokens`` are masked **only** on the first step --
+      // this is how the hallucination-repair "escape" round forces
+      // the model away from the loop-starting token.
+      //
+      // Stops on the first ``eot_id`` emission or after
+      // ``max_new_tokens`` steps.  Returns the new state (with
+      // ``collected_attention`` populated) and the generated token
+      // list (which may end with ``eot_id`` when EOT was emitted).
+      std::pair<WhisperDecoderState, std::vector<size_t>>
+      generate_greedy_with_attention(StorageView features,
+                                     const std::vector<size_t>& prompt,
+                                     size_t max_new_tokens,
+                                     size_t eot_id,
+                                     const std::vector<size_t>& suppress_tokens,
+                                     const std::vector<size_t>& ban_first_tokens);
+
     private:
       const std::shared_ptr<const WhisperModel> _model;
       const std::unique_ptr<layers::WhisperEncoder> _encoder;
@@ -303,6 +339,26 @@ namespace ctranslate2 {
       std::future<std::pair<size_t, StorageView>>
       forward_step_greedy_with_attention(WhisperDecoderState& state,
                                          size_t token_id);
+
+      // Async wrapper around ``WhisperReplica::generate_greedy_with_attention``.
+      // The whole greedy loop runs inside one replica job, so the Python
+      // caller pays a single round-trip per generation segment instead of
+      // one per token.  ``ban_first_tokens`` is applied only on the
+      // first step (used to break loop-starting tokens during repair).
+      std::future<std::pair<WhisperDecoderState, std::vector<size_t>>>
+      generate_greedy_with_attention(StorageView features,
+                                     std::vector<size_t> prompt,
+                                     size_t max_new_tokens,
+                                     size_t eot_id,
+                                     std::vector<size_t> suppress_tokens,
+                                     std::vector<size_t> ban_first_tokens);
+
+      // Async wrapper for the bulk attention transfer.  Performs the
+      // concat + (optional) head-mean on the device that owns the state,
+      // then copies once to CPU.
+      std::future<StorageView>
+      collected_attention_to_cpu(const WhisperDecoderState& state,
+                                 bool average_heads = true);
 
     private:
       std::vector<std::pair<dim_t, dim_t>> _alignment_heads;
