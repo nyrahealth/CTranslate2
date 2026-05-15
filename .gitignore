@@ -6,6 +6,7 @@ CMake*.json
 .idea
 python/build/
 python/ctranslate2.egg-info/
+python/ctranslate2_crisperwhisper.egg-info/
 python/dist/
 .cache
 docs/build/
