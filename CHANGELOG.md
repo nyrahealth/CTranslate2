@@ -2,6 +2,20 @@
 
 ### New features
 
+* Whisper: per-step cross-attention capture for word timings
+  (`set_alignment_heads`, `prefill_with_attention`,
+  `forward_step_with_attention`, `forward_step_greedy_with_attention`,
+  `generate_greedy_with_attention`, `collected_attention_to_cpu`), with
+  `truncate_to_step` trimming the cached attention so it stays
+  consistent across rewinds (hallucination repair / speculative
+  rollback).
+* Whisper: `forward_batch_with_attention` — like `forward_batch` but also
+  returns the per-position, head-averaged, post-softmax cross-attention
+  over encoder frames (`[T, F_enc]` on CPU).  Lets speculative decoding
+  recover the main model's attention for the always-verified token and
+  verifier corrections in the same batched verify pass (no extra forward
+  compute), enabling word timings under speculative decoding.
+
 ### Fixes and improvements
 
 ## [v4.7.1](https://github.com/OpenNMT/CTranslate2/releases/tag/v4.7.1) (2026-02-04)

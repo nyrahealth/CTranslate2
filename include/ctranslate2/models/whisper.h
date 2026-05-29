@@ -190,6 +190,19 @@ namespace ctranslate2 {
       std::vector<size_t> forward_batch_greedy(WhisperDecoderState& state,
                                                const std::vector<size_t>& token_ids);
 
+      // Like ``forward_batch`` but also returns the per-position
+      // post-softmax cross-attention over encoder frames for the selected
+      // alignment heads.  Used by speculative decoding's word-timing path
+      // to recover main-model attention for the always-verified token and
+      // for verifier-correction tokens in the same batched pass (no extra
+      // compute).  ``attention`` is head-averaged and returned on CPU with
+      // shape ``[T, F_enc]`` (T = ``token_ids.size()``); ``attention[i]``
+      // is the row used to predict the token following ``token_ids[i]``.
+      // Requires ``set_alignment_heads([...])`` first.
+      std::pair<StorageView, StorageView>
+      forward_batch_with_attention(WhisperDecoderState& state,
+                                   const std::vector<size_t>& token_ids);
+
       // Configure which (layer, head) cross-attention rows to collect on
       // subsequent ``*_with_attention`` calls.  Also enables post-softmax
       // attention output on the decoder.  Pass an empty list to disable
@@ -339,6 +352,13 @@ namespace ctranslate2 {
       std::future<std::pair<size_t, StorageView>>
       forward_step_greedy_with_attention(WhisperDecoderState& state,
                                          size_t token_id);
+
+      // Async wrapper around ``WhisperReplica::forward_batch_with_attention``.
+      // Returns ``(logits, attention)`` where ``attention`` is the
+      // head-averaged per-position cross-attention on CPU ``[T, F_enc]``.
+      std::future<std::pair<StorageView, StorageView>>
+      forward_batch_with_attention(WhisperDecoderState& state,
+                                   std::vector<size_t> token_ids);
 
       // Async wrapper around ``WhisperReplica::generate_greedy_with_attention``.
       // The whole greedy loop runs inside one replica job, so the Python

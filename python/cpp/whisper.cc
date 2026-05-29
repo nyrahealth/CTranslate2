@@ -102,6 +102,14 @@ namespace ctranslate2 {
         return _pool->forward_step_greedy_with_attention(*state, token_id).get();
       }
 
+      std::pair<StorageView, StorageView>
+      forward_batch_with_attention(std::shared_ptr<models::WhisperDecoderState> state,
+                                   Ids token_ids) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        return _pool->forward_batch_with_attention(*state, std::move(token_ids)).get();
+      }
+
       StorageView
       collected_attention_to_cpu(std::shared_ptr<models::WhisperDecoderState> state,
                                  bool average_heads) {
@@ -676,6 +684,33 @@ namespace ctranslate2 {
                  Returns:
                    A tuple ``(picked_token_id, attention)`` where ``attention``
                    has shape ``[1, num_selected_heads, F_enc]``.
+             )pbdoc")
+
+        .def("forward_batch_with_attention",
+             &WhisperWrapper::forward_batch_with_attention,
+             py::arg("state"),
+             py::arg("token_ids"),
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Like :meth:`forward_batch`, but also returns the per-position
+                 cross-attention over encoder frames for the configured
+                 alignment heads.
+
+                 Used by speculative decoding's word-timing path to recover
+                 main-model attention for the always-verified token and for
+                 verifier-correction tokens in the same batched pass (no extra
+                 forward compute).  Requires :meth:`set_alignment_heads` first.
+
+                 Arguments:
+                   state: A :class:`WhisperDecoderState` (mutated in-place).
+                   token_ids: List of token IDs to process.
+
+                 Returns:
+                   A tuple ``(logits, attention)`` where ``logits`` has shape
+                   ``[1, T, vocab_size]`` and ``attention`` is the
+                   head-averaged, post-softmax cross-attention on CPU with
+                   shape ``[T, F_enc]`` (``attention[i]`` is the row used to
+                   predict the token following ``token_ids[i]``).
              )pbdoc")
 
         .def("collected_attention_to_cpu",

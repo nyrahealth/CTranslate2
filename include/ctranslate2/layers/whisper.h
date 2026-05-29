@@ -80,7 +80,8 @@ namespace ctranslate2 {
       void forward_with_logits(const StorageView& ids,
                                dim_t step,
                                DecoderState& state,
-                               StorageView& logits);
+                               StorageView& logits,
+                               StorageView* attention = nullptr);
 
     private:
       bool _return_normalized_attention = false;

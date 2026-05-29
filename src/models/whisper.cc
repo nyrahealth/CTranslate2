@@ -1194,6 +1194,55 @@ namespace ctranslate2 {
       return cpu;
     }
 
+    std::pair<StorageView, StorageView>
+    WhisperReplica::forward_batch_with_attention(WhisperDecoderState& wds,
+                                                 const std::vector<size_t>& token_ids) {
+      PROFILE("WhisperReplica::forward_batch_with_attention");
+      require_alignment_heads_configured(*_decoder);
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      const Device device = _decoder->device();
+      _decoder->update_output_layer(_model->preferred_size_multiple());
+
+      std::vector<std::vector<size_t>> batch = {token_ids};
+      const StorageView ids = layers::make_sequence_inputs(batch, device);
+
+      StorageView logits(_decoder->output_type(), device);
+      // For a multi-position (sequence) input the decoder writes the
+      // cross-attention as ``[1, num_selected_heads, T, F_enc]``
+      // (post-softmax, since set_alignment_heads enabled normalized
+      // attention).
+      StorageView attention(_decoder->output_type(), device);
+      _decoder->forward_with_logits(ids, wds.current_step, wds.state, logits, &attention);
+      wds.current_step += static_cast<dim_t>(token_ids.size());
+
+      // Head-average -> ``[1, 1, T, F]`` then drop the head + batch axes
+      // to a clean ``[T, F_enc]`` matrix on CPU (single bulk transfer).
+      StorageView reduced(attention.dtype(), device);
+      ops::Mean(/*axis=*/1)(attention, reduced);
+
+      StorageView fp32(DataType::FLOAT32, device);
+      if (reduced.dtype() == DataType::FLOAT32)
+        fp32 = std::move(reduced);
+      else
+        fp32 = reduced.to(DataType::FLOAT32);
+
+      StorageView cpu = fp32.to(Device::CPU);
+      // ``cpu`` is ``[1, 1, T, F]``: squeeze the head axis (1) then the
+      // batch axis (0).  Guard each squeeze in case a degenerate shape
+      // (e.g. T == 1) collapsed an axis earlier.
+      if (cpu.rank() == 4 && cpu.dim(1) == 1)
+        cpu.squeeze(1);
+      if (cpu.rank() == 3 && cpu.dim(0) == 1)
+        cpu.squeeze(0);
+
+      return {std::move(logits), std::move(cpu)};
+    }
+
 
     std::future<std::pair<WhisperDecoderState, StorageView>>
     Whisper::prefill(const StorageView& features,
@@ -1293,6 +1342,18 @@ namespace ctranslate2 {
         (WhisperReplica& replica) mutable {
           replica.set_alignment_heads(heads);
           return replica.forward_step_greedy_with_attention(state, token_id);
+        });
+    }
+
+    std::future<std::pair<StorageView, StorageView>>
+    Whisper::forward_batch_with_attention(WhisperDecoderState& state,
+                                          std::vector<size_t> token_ids) {
+      auto heads = get_alignment_heads_copy();
+      return post<std::pair<StorageView, StorageView>>(
+        [&state, token_ids = std::move(token_ids), heads = std::move(heads)]
+        (WhisperReplica& replica) mutable {
+          replica.set_alignment_heads(heads);
+          return replica.forward_batch_with_attention(state, token_ids);
         });
     }
 
