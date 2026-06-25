@@ -3,6 +3,7 @@
 #include <algorithm>
 
 #include "ctranslate2/decoding.h"
+#include "ctranslate2/decoding_utils.h"
 #include "ctranslate2/ops/concat.h"
 #include "ctranslate2/ops/mean.h"
 #include "ctranslate2/ops/topk.h"
@@ -853,7 +854,8 @@ namespace ctranslate2 {
 
     size_t
     WhisperReplica::forward_step_greedy(WhisperDecoderState& wds,
-                                        size_t token_id) {
+                                        size_t token_id,
+                                        const std::vector<size_t>& suppress_tokens) {
       PROFILE("WhisperReplica::forward_step_greedy");
 
 #ifdef CT2_WITH_CUDA
@@ -869,6 +871,15 @@ namespace ctranslate2 {
       (*_decoder)(wds.current_step, ids, wds.state, &logits);
       wds.current_step++;
 
+      // Mask suppressed tokens on the device before argmax so suppression
+      // stays on the fast greedy path (no full-vocab transfer to Python).
+      if (!suppress_tokens.empty()) {
+        DisableTokens disable(logits);
+        for (const size_t tid : suppress_tokens)
+          disable.add(static_cast<dim_t>(tid));
+        disable.apply();
+      }
+
       StorageView best_ids(DataType::INT32, device);
       StorageView best_scores(logits.dtype(), device);
       ops::TopK(1)(logits, best_scores, best_ids);
@@ -880,7 +891,8 @@ namespace ctranslate2 {
 
     std::vector<size_t>
     WhisperReplica::forward_batch_greedy(WhisperDecoderState& wds,
-                                         const std::vector<size_t>& token_ids) {
+                                         const std::vector<size_t>& token_ids,
+                                         const std::vector<size_t>& suppress_tokens) {
       PROFILE("WhisperReplica::forward_batch_greedy");
 
 #ifdef CT2_WITH_CUDA
@@ -897,6 +909,23 @@ namespace ctranslate2 {
       StorageView logits(_decoder->output_type(), device);
       _decoder->forward_with_logits(ids, wds.current_step, wds.state, logits);
       wds.current_step += static_cast<dim_t>(token_ids.size());
+
+      // Mask suppressed tokens at every position on the device before the
+      // per-position argmax.  ``forward_with_logits`` returns logits shaped
+      // ``[1, seq, vocab]``; DisableTokens treats dim(0) as batch and
+      // dim(1) as vocab, so reshape to ``[seq, vocab]`` first.  ``add(tid)``
+      // then disables the token for all positions, matching a
+      // non-speculative suppressed decode.
+      if (!suppress_tokens.empty()) {
+        const dim_t vocab = logits.dim(-1);
+        const Shape saved_shape = logits.shape();
+        logits.reshape({logits.size() / vocab, vocab});
+        DisableTokens disable(logits);
+        for (const size_t tid : suppress_tokens)
+          disable.add(static_cast<dim_t>(tid));
+        disable.apply();
+        logits.reshape(saved_shape);
+      }
 
       StorageView best_ids(DataType::INT32, device);
       StorageView best_scores(logits.dtype(), device);
@@ -1138,6 +1167,224 @@ namespace ctranslate2 {
       return {std::move(wds), std::move(generated)};
     }
 
+    // --- Helpers for generate_speculative -------------------------------
+
+    namespace {
+      // ``table[id]`` with empty-table == identity and out-of-range == -1.
+      inline int32_t map_token(const std::vector<int32_t>& table, size_t id) {
+        if (table.empty())
+          return static_cast<int32_t>(id);
+        if (id < table.size())
+          return table[id];
+        return -1;
+      }
+
+      // On-device argmax over a ``[1, vocab]`` (or ``[.., vocab]``) logits
+      // tensor with optional token suppression, mirroring
+      // ``forward_step_greedy``'s tail so the prefill / verify argmaxes
+      // stay on the GPU.
+      inline size_t argmax_suppressed_device(StorageView& logits,
+                                             const std::vector<size_t>& suppress_tokens) {
+        const Device device = logits.device();
+        if (!suppress_tokens.empty()) {
+          DisableTokens disable(logits);
+          for (const size_t tid : suppress_tokens)
+            disable.add(static_cast<dim_t>(tid));
+          disable.apply();
+        }
+        StorageView best_ids(DataType::INT32, device);
+        StorageView best_scores(logits.dtype(), device);
+        ops::TopK(1)(logits, best_scores, best_ids);
+        StorageView best_ids_cpu(DataType::INT32);
+        best_ids_cpu.copy_from(best_ids);
+        return static_cast<size_t>(best_ids_cpu.scalar_at<int32_t>({0, 0}));
+      }
+    }
+
+    std::vector<size_t>
+    WhisperReplica::generate_speculative(
+        WhisperReplica& draft,
+        StorageView main_features,
+        StorageView draft_features,
+        const std::vector<size_t>& prompt,
+        size_t num_speculative_tokens,
+        size_t max_length,
+        size_t eot_id,
+        const std::vector<size_t>& suppress_tokens,
+        const std::vector<int32_t>& d2m,
+        const std::vector<int32_t>& m2d) {
+      PROFILE("WhisperReplica::generate_speculative");
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      const size_t K = num_speculative_tokens;
+
+      // Encode both models once and reuse the encoder output for every
+      // (re-)prefill (matches the Python ``_encode_both`` + reuse).  A
+      // fresh copy is handed to each ``prefill`` because it takes the
+      // features by value; ``maybe_encode`` detects already-encoded
+      // input and passes it straight through.
+      const StorageView main_enc = maybe_encode(std::move(main_features));
+      const StorageView draft_enc = draft.maybe_encode(std::move(draft_features));
+
+      auto to_draft = [&](size_t main_id) -> int32_t {
+        return map_token(m2d, main_id);
+      };
+      auto to_main = [&](size_t draft_id) -> int32_t {
+        return map_token(d2m, draft_id);
+      };
+      auto prompt_to_draft = [&](const std::vector<size_t>& main_prompt) {
+        std::vector<size_t> out;
+        out.reserve(main_prompt.size());
+        for (const size_t t : main_prompt) {
+          const int32_t d = to_draft(t);
+          out.push_back(d == -1 ? t : static_cast<size_t>(d));
+        }
+        return out;
+      };
+
+      const int32_t draft_eot_i = to_draft(eot_id);
+      const size_t draft_eot =
+          draft_eot_i == -1 ? eot_id : static_cast<size_t>(draft_eot_i);
+
+      // Prefill both decoders from a main-space prompt and return the
+      // main model's (suppressed) first-token argmax.
+      auto prefill_both = [&](const std::vector<size_t>& main_prompt,
+                              WhisperDecoderState& main_state,
+                              WhisperDecoderState& draft_state) -> size_t {
+        const std::vector<size_t> draft_prompt = prompt_to_draft(main_prompt);
+        auto mres = prefill(StorageView(main_enc), main_prompt);
+        main_state = std::move(mres.first);
+        StorageView main_logits = std::move(mres.second);
+        auto dres = draft.prefill(StorageView(draft_enc), draft_prompt);
+        draft_state = std::move(dres.first);
+        return argmax_suppressed_device(main_logits, suppress_tokens);
+      };
+
+      WhisperDecoderState main_state;
+      WhisperDecoderState draft_state;
+      size_t main_next = prefill_both(prompt, main_state, draft_state);
+
+      std::vector<size_t> accepted;
+      const std::vector<size_t>& full_prompt = prompt;
+
+      auto reprefill_full = [&]() {
+        std::vector<size_t> fp(full_prompt);
+        fp.insert(fp.end(), accepted.begin(), accepted.end());
+        main_next = prefill_both(fp, main_state, draft_state);
+      };
+
+      while (accepted.size() < max_length) {
+        if (main_next == eot_id) {
+          accepted.push_back(main_next);
+          break;
+        }
+
+        const size_t budget = max_length - accepted.size();
+        if (budget <= 1) {  // draft_n = min(K, budget - 1) <= 0
+          accepted.push_back(main_next);
+          break;
+        }
+        const size_t draft_n = std::min(K, budget - 1);
+
+        // --- Draft phase (greedy, no suppression on the draft model) ---
+        std::vector<size_t> candidates_main;
+        std::vector<size_t> candidates_draft;
+        const int32_t seed_draft = to_draft(main_next);
+
+        if (seed_draft == -1) {
+          accepted.push_back(main_next);
+          reprefill_full();
+          continue;
+        }
+
+        size_t draft_tok = static_cast<size_t>(seed_draft);
+        for (size_t i = 0; i < draft_n; ++i) {
+          draft_tok = draft.forward_step_greedy(draft_state, draft_tok, {});
+          const int32_t main_tok = to_main(draft_tok);
+          if (main_tok == -1)
+            break;
+          candidates_draft.push_back(draft_tok);
+          candidates_main.push_back(static_cast<size_t>(main_tok));
+          if (draft_tok == draft_eot)
+            break;
+        }
+
+        if (candidates_main.empty()) {
+          accepted.push_back(main_next);
+          reprefill_full();
+          continue;
+        }
+
+        // --- Verify phase (single batched main pass) ---
+        const dim_t main_step_before_verify = main_state.current_step;
+        std::vector<size_t> batch_tokens;
+        batch_tokens.reserve(candidates_main.size() + 1);
+        batch_tokens.push_back(main_next);
+        batch_tokens.insert(batch_tokens.end(),
+                            candidates_main.begin(), candidates_main.end());
+
+        const std::vector<size_t> verify_preds =
+            forward_batch_greedy(main_state, batch_tokens, suppress_tokens);
+
+        // --- Strict acceptance ---
+        size_t n_draft_accepted = 0;
+        bool has_correction = false;
+        size_t correction = 0;
+        for (size_t j = 0; j < candidates_main.size(); ++j) {
+          if (j >= verify_preds.size())
+            break;
+          if (verify_preds[j] == candidates_main[j]) {
+            ++n_draft_accepted;
+            if (candidates_main[j] == eot_id)
+              break;
+          } else {
+            correction = verify_preds[j];
+            has_correction = true;
+            break;
+          }
+        }
+
+        accepted.push_back(main_next);
+        for (size_t j = 0; j < n_draft_accepted; ++j)
+          accepted.push_back(candidates_main[j]);
+        if (has_correction)
+          accepted.push_back(correction);
+
+        if (!accepted.empty() && accepted.back() == eot_id)
+          break;
+
+        // --- State management ---
+        const bool all_accepted =
+            (n_draft_accepted == candidates_main.size()) && !has_correction;
+
+        if (all_accepted) {
+          if (!candidates_draft.empty())
+            draft.forward_step_greedy(draft_state, candidates_draft.back(), {});
+          const size_t last_idx = candidates_main.size();
+          if (last_idx < verify_preds.size()) {
+            main_next = verify_preds[last_idx];
+          } else {
+            reprefill_full();
+          }
+        } else {
+          const dim_t rollback_to =
+              main_step_before_verify + 1 + static_cast<dim_t>(n_draft_accepted);
+          main_state.truncate_to_step(rollback_to);
+          main_next = forward_step_greedy(main_state, accepted.back(),
+                                          suppress_tokens);
+          std::vector<size_t> fp(full_prompt);
+          fp.insert(fp.end(), accepted.begin(), accepted.end());
+          auto dres = draft.prefill(StorageView(draft_enc), prompt_to_draft(fp));
+          draft_state = std::move(dres.first);
+        }
+      }
+
+      return accepted;
+    }
+
     StorageView
     WhisperReplica::collected_attention_to_cpu(const WhisperDecoderState& state,
                                                bool average_heads) const {
@@ -1277,21 +1524,24 @@ namespace ctranslate2 {
 
     std::future<size_t>
     Whisper::forward_step_greedy(WhisperDecoderState& state,
-                                 size_t token_id) {
+                                 size_t token_id,
+                                 std::vector<size_t> suppress_tokens) {
       return post<size_t>(
-        [&state, token_id]
+        [&state, token_id, suppress_tokens = std::move(suppress_tokens)]
         (WhisperReplica& replica) mutable {
-          return replica.forward_step_greedy(state, token_id);
+          return replica.forward_step_greedy(state, token_id, suppress_tokens);
         });
     }
 
     std::future<std::vector<size_t>>
     Whisper::forward_batch_greedy(WhisperDecoderState& state,
-                                  std::vector<size_t> token_ids) {
+                                  std::vector<size_t> token_ids,
+                                  std::vector<size_t> suppress_tokens) {
       return post<std::vector<size_t>>(
-        [&state, token_ids = std::move(token_ids)]
+        [&state, token_ids = std::move(token_ids),
+         suppress_tokens = std::move(suppress_tokens)]
         (WhisperReplica& replica) mutable {
-          return replica.forward_batch_greedy(state, token_ids);
+          return replica.forward_batch_greedy(state, token_ids, suppress_tokens);
         });
     }
 
@@ -1393,6 +1643,48 @@ namespace ctranslate2 {
               eot_id,
               suppress_tokens,
               ban_first_tokens);
+        });
+    }
+
+    std::future<std::vector<size_t>>
+    Whisper::generate_speculative(
+        Whisper& draft_pool,
+        StorageView main_features,
+        StorageView draft_features,
+        std::vector<size_t> prompt,
+        size_t num_speculative_tokens,
+        size_t max_length,
+        size_t eot_id,
+        std::vector<size_t> suppress_tokens,
+        std::vector<int32_t> d2m,
+        std::vector<int32_t> m2d) {
+      return post<std::vector<size_t>>(
+        [&draft_pool,
+         main_features = main_features.sync_copy(),
+         draft_features = draft_features.sync_copy(),
+         prompt = std::move(prompt),
+         num_speculative_tokens,
+         max_length,
+         eot_id,
+         suppress_tokens = std::move(suppress_tokens),
+         d2m = std::move(d2m),
+         m2d = std::move(m2d)]
+        (WhisperReplica& replica) mutable {
+          // Drive the draft model's replica directly from this (main)
+          // worker thread; no job is posted to the draft pool, so both
+          // models share one CUDA stream and never race.
+          WhisperReplica& draft_replica = draft_pool.get_first_replica_mutable();
+          return replica.generate_speculative(
+              draft_replica,
+              std::move(main_features),
+              std::move(draft_features),
+              prompt,
+              num_speculative_tokens,
+              max_length,
+              eot_id,
+              suppress_tokens,
+              d2m,
+              m2d);
         });
     }
 

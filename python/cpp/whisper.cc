@@ -1,5 +1,7 @@
 #include "module.h"
 
+#include <optional>
+
 #include <ctranslate2/models/whisper.h>
 
 #include "replica_pool.h"
@@ -52,18 +54,22 @@ namespace ctranslate2 {
       }
 
       size_t forward_step_greedy(std::shared_ptr<models::WhisperDecoderState> state,
-                                 size_t token_id) {
+                                 size_t token_id,
+                                 Ids suppress_tokens) {
         std::shared_lock lock(_mutex);
         assert_model_is_ready();
-        return _pool->forward_step_greedy(*state, token_id).get();
+        return _pool->forward_step_greedy(
+            *state, token_id, std::move(suppress_tokens)).get();
       }
 
       std::vector<size_t> forward_batch_greedy(
           std::shared_ptr<models::WhisperDecoderState> state,
-          Ids token_ids) {
+          Ids token_ids,
+          Ids suppress_tokens) {
         std::shared_lock lock(_mutex);
         assert_model_is_ready();
-        return _pool->forward_batch_greedy(*state, std::move(token_ids)).get();
+        return _pool->forward_batch_greedy(
+            *state, std::move(token_ids), std::move(suppress_tokens)).get();
       }
 
       void set_alignment_heads(const std::vector<std::pair<int64_t, int64_t>>& heads) {
@@ -137,6 +143,41 @@ namespace ctranslate2 {
         auto state_ptr = std::make_shared<models::WhisperDecoderState>(
             std::move(result.first));
         return {state_ptr, std::move(result.second)};
+      }
+
+      std::vector<size_t>
+      generate_speculative(WhisperWrapper& draft,
+                           const StorageView& main_features,
+                           const StorageView& draft_features,
+                           Ids prompt,
+                           size_t num_speculative_tokens,
+                           size_t max_length,
+                           size_t eot_id,
+                           Ids suppress_tokens,
+                           std::vector<int32_t> d2m,
+                           std::vector<int32_t> m2d) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        // The draft may be the *same* wrapper as the main model (same-model
+        // draft, used in the exactness tests).  Re-locking the same
+        // ``std::shared_mutex`` for shared ownership on one thread is UB,
+        // so only take the draft lock when it is a distinct object.
+        std::optional<std::shared_lock<std::shared_mutex>> draft_lock;
+        if (&draft != this) {
+          draft_lock.emplace(draft._mutex);
+          draft.assert_model_is_ready();
+        }
+        return _pool->generate_speculative(
+            *draft._pool,
+            main_features,
+            draft_features,
+            std::move(prompt),
+            num_speculative_tokens,
+            max_length,
+            eot_id,
+            std::move(suppress_tokens),
+            std::move(d2m),
+            std::move(m2d)).get();
       }
 
       std::variant<std::vector<models::WhisperGenerationResult>,
@@ -574,6 +615,7 @@ namespace ctranslate2 {
         .def("forward_step_greedy", &WhisperWrapper::forward_step_greedy,
              py::arg("state"),
              py::arg("token_id"),
+             py::arg("suppress_tokens") = std::vector<size_t>(),
              py::call_guard<py::gil_scoped_release>(),
              R"pbdoc(
                  Run one decoder step and return the greedy (argmax) token ID.
@@ -585,6 +627,10 @@ namespace ctranslate2 {
                  Arguments:
                    state: A :class:`WhisperDecoderState` (mutated in-place).
                    token_id: The token ID to feed at the current step.
+                   suppress_tokens: Optional list of token IDs to mask to
+                     -inf on the device before the argmax.  Lets token
+                     suppression stay on the fast greedy path (no full-vocab
+                     logits transfer).  Empty means no suppression.
 
                  Returns:
                    The greedy next-token ID.
@@ -593,6 +639,7 @@ namespace ctranslate2 {
         .def("forward_batch_greedy", &WhisperWrapper::forward_batch_greedy,
              py::arg("state"),
              py::arg("token_ids"),
+             py::arg("suppress_tokens") = std::vector<size_t>(),
              py::call_guard<py::gil_scoped_release>(),
              R"pbdoc(
                  Process multiple tokens and return greedy predictions at each position.
@@ -603,6 +650,9 @@ namespace ctranslate2 {
                  Arguments:
                    state: A :class:`WhisperDecoderState` (mutated in-place).
                    token_ids: List of token IDs to process.
+                   suppress_tokens: Optional list of token IDs to mask to
+                     -inf at every position on the device before the
+                     per-position argmax.  Empty means no suppression.
 
                  Returns:
                    List of greedy next-token IDs (one per input position).
@@ -789,6 +839,57 @@ namespace ctranslate2 {
                    of newly emitted token ids, of length
                    ``len(state.collected_attention)``; the final element will
                    equal ``eot_id`` when generation stopped on EOT.
+             )pbdoc")
+
+        .def("generate_speculative",
+             &WhisperWrapper::generate_speculative,
+             py::arg("draft"),
+             py::arg("main_features"),
+             py::arg("draft_features"),
+             py::kw_only(),
+             py::arg("prompt"),
+             py::arg("num_speculative_tokens"),
+             py::arg("max_length"),
+             py::arg("eot_id"),
+             py::arg("suppress_tokens") = std::vector<size_t>{},
+             py::arg("d2m") = std::vector<int32_t>{},
+             py::arg("m2d") = std::vector<int32_t>{},
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Run the whole **strict** speculative-decoding loop in C++,
+                 inside a single CTranslate2 thread-pool job.
+
+                 ``self`` is the verifier (main model); ``draft`` is a second
+                 :class:`Whisper` whose first replica proposes
+                 ``num_speculative_tokens`` tokens per round.  Both models run
+                 on the main worker thread (one CUDA stream), and only picked
+                 token ids leave the device -- there is no per-token Python
+                 dispatch, which is the overhead this path removes versus
+                 driving ``forward_step_greedy`` / ``forward_batch_greedy``
+                 from Python.
+
+                 Arguments:
+                   draft: The draft :class:`Whisper` model (may be ``self`` for
+                     a same-model draft).
+                   main_features: Mel spectrogram (or pre-encoded features) for
+                     the main model.
+                   draft_features: Mel spectrogram (or pre-encoded features) for
+                     the draft model (same array as ``main_features`` when both
+                     models use the same number of mel bins).
+                   prompt: Decoder prompt token ids, in **main**-vocab space.
+                   num_speculative_tokens: Tokens drafted per verify round (K).
+                   max_length: Maximum number of tokens to generate.
+                   eot_id: End-of-text token id (main-vocab space).
+                   suppress_tokens: Main-vocab token ids masked on the device
+                     before every main-model argmax.  Empty means none.
+                   d2m: ``draft_id -> main_id`` lookup table (-1 = unmapped);
+                     empty means the identity mapping.
+                   m2d: ``main_id -> draft_id`` lookup table (-1 = unmapped);
+                     empty means the identity mapping.
+
+                 Returns:
+                   The accepted token ids in main-vocab space (including a
+                   trailing ``eot_id`` when generation stopped on EOT).
              )pbdoc")
 
         .def("unload_model", &WhisperWrapper::unload_model,

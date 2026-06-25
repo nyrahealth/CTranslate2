@@ -184,11 +184,17 @@ namespace ctranslate2 {
       StorageView forward_batch(WhisperDecoderState& state,
                                 const std::vector<size_t>& token_ids);
 
+      // ``suppress_tokens`` (main-vocab IDs) are masked to -inf on the
+      // device before the argmax, so token suppression stays on the fast
+      // greedy path (no full-vocab logits transfer to Python).  An empty
+      // list means no suppression.
       size_t forward_step_greedy(WhisperDecoderState& state,
-                                 size_t token_id);
+                                 size_t token_id,
+                                 const std::vector<size_t>& suppress_tokens = {});
 
       std::vector<size_t> forward_batch_greedy(WhisperDecoderState& state,
-                                               const std::vector<size_t>& token_ids);
+                                               const std::vector<size_t>& token_ids,
+                                               const std::vector<size_t>& suppress_tokens = {});
 
       // Like ``forward_batch`` but also returns the per-position
       // post-softmax cross-attention over encoder frames for the selected
@@ -268,6 +274,40 @@ namespace ctranslate2 {
                                      const std::vector<size_t>& suppress_tokens,
                                      const std::vector<size_t>& ban_first_tokens);
 
+      // Runs the entire *strict* speculative-decoding loop natively inside
+      // a single thread-pool job: this replica is the verifier ("main"),
+      // ``draft`` proposes ``num_speculative_tokens`` tokens per round,
+      // and the main model verifies them in one batched pass.  KV-caches
+      // for both models are kept on the device and only the picked token
+      // ids cross to the host -- no per-token Python dispatch.
+      //
+      // Both models run on *this* worker thread (one CUDA stream), so the
+      // draft state and main state never race.  ``draft`` may alias
+      // ``*this`` (same-model draft): the two decoder states are
+      // independent so this is safe.
+      //
+      // Token-space translation between the two vocabularies is supplied
+      // as lookup tables: ``d2m[draft_id] -> main_id`` and
+      // ``m2d[main_id] -> draft_id`` (value -1 means "unmapped").  An
+      // *empty* table means the identity mapping (same vocabulary).
+      //
+      // ``suppress_tokens`` (main-vocab ids) are masked on the device
+      // before every main-model argmax (prefill, verify, rollback),
+      // exactly matching a non-speculative suppressed decode.  The
+      // returned ids are in main-vocab space and include the trailing
+      // ``eot_id`` when generation stopped on EOT.
+      std::vector<size_t>
+      generate_speculative(WhisperReplica& draft,
+                           StorageView main_features,
+                           StorageView draft_features,
+                           const std::vector<size_t>& prompt,
+                           size_t num_speculative_tokens,
+                           size_t max_length,
+                           size_t eot_id,
+                           const std::vector<size_t>& suppress_tokens,
+                           const std::vector<int32_t>& d2m,
+                           const std::vector<int32_t>& m2d);
+
     private:
       const std::shared_ptr<const WhisperModel> _model;
       const std::unique_ptr<layers::WhisperEncoder> _encoder;
@@ -328,11 +368,13 @@ namespace ctranslate2 {
 
       std::future<size_t>
       forward_step_greedy(WhisperDecoderState& state,
-                          size_t token_id);
+                          size_t token_id,
+                          std::vector<size_t> suppress_tokens = {});
 
       std::future<std::vector<size_t>>
       forward_batch_greedy(WhisperDecoderState& state,
-                           std::vector<size_t> token_ids);
+                           std::vector<size_t> token_ids,
+                           std::vector<size_t> suppress_tokens = {});
 
       // Configure the (layer, head) cross-attention rows to collect on
       // subsequent ``*_with_attention`` calls.  The configuration is
@@ -372,6 +414,23 @@ namespace ctranslate2 {
                                      size_t eot_id,
                                      std::vector<size_t> suppress_tokens,
                                      std::vector<size_t> ban_first_tokens);
+
+      // Async wrapper around ``WhisperReplica::generate_speculative``.
+      // The whole strict speculative loop runs inside one job on *this*
+      // pool's worker thread; ``draft_pool``'s first replica is driven
+      // directly from that same thread (no job is posted to it), so the
+      // Python caller pays a single round-trip per generated segment.
+      std::future<std::vector<size_t>>
+      generate_speculative(Whisper& draft_pool,
+                           StorageView main_features,
+                           StorageView draft_features,
+                           std::vector<size_t> prompt,
+                           size_t num_speculative_tokens,
+                           size_t max_length,
+                           size_t eot_id,
+                           std::vector<size_t> suppress_tokens,
+                           std::vector<int32_t> d2m,
+                           std::vector<int32_t> m2d);
 
       // Async wrapper for the bulk attention transfer.  Performs the
       // concat + (optional) head-mean on the device that owns the state,

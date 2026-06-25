@@ -152,6 +152,14 @@ namespace ctranslate2 {
       return worker.replica();
     }
 
+    // Non-const accessor to the first replica.  Used to drive a second
+    // model (e.g. a speculative-decoding draft) directly from another
+    // pool's worker thread, without posting a separate job to this pool.
+    Replica& get_first_replica_mutable() {
+      auto& worker = static_cast<ReplicaWorker<Replica>&>(_thread_pool->get_worker(0));
+      return worker.replica();
+    }
+
   protected:
     template <typename Result, typename Func>
     std::vector<std::future<Result>>
