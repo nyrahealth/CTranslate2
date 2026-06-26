@@ -157,7 +157,8 @@ namespace ctranslate2 {
                            std::vector<int32_t> d2m,
                            std::vector<int32_t> m2d,
                            size_t min_speculative_tokens,
-                           size_t max_speculative_tokens) {
+                           size_t max_speculative_tokens,
+                           bool reset_adaptive_state) {
         std::shared_lock lock(_mutex);
         assert_model_is_ready();
         // The draft may be the *same* wrapper as the main model (same-model
@@ -181,7 +182,8 @@ namespace ctranslate2 {
             std::move(d2m),
             std::move(m2d),
             min_speculative_tokens,
-            max_speculative_tokens).get();
+            max_speculative_tokens,
+            reset_adaptive_state).get();
       }
 
       std::variant<std::vector<models::WhisperGenerationResult>,
@@ -860,6 +862,7 @@ namespace ctranslate2 {
              py::arg("m2d") = std::vector<int32_t>{},
              py::arg("min_speculative_tokens") = 0,
              py::arg("max_speculative_tokens") = 0,
+             py::arg("reset_adaptive_state") = true,
              py::call_guard<py::gil_scoped_release>(),
              R"pbdoc(
                  Run the whole **strict** speculative-decoding loop in C++,
@@ -895,12 +898,19 @@ namespace ctranslate2 {
                    min_speculative_tokens: Lower bound for adaptive K.
                    max_speculative_tokens: Upper bound for adaptive K.  When
                      greater than ``min_speculative_tokens`` the number of
-                     tokens drafted per round adapts to recent draft
-                     acceptance (bump up on a fully-accepted round, nudge
-                     down on any rejection), starting from
-                     ``num_speculative_tokens`` and clamped to
-                     ``[min_speculative_tokens, max_speculative_tokens]``.
-                     Leave at 0 to keep K fixed at ``num_speculative_tokens``.
+                     tokens drafted per round self-tunes to recent draft
+                     acceptance with a symmetric +1/-1 controller (bump up on
+                     a fully-accepted round, nudge down on any rejection),
+                     clamped to ``[min_speculative_tokens,
+                     max_speculative_tokens]``.  The controller's K persists
+                     across calls, so over a chunked transcription it
+                     converges to the per-audio equilibrium regardless of the
+                     seed.  Leave at 0 to keep K fixed at
+                     ``num_speculative_tokens``.
+                   reset_adaptive_state: Re-seed the persistent adaptive K
+                     from ``num_speculative_tokens`` (pass True on the first
+                     chunk of a new audio; False to keep converging across
+                     subsequent chunks).  Ignored when K is fixed.
 
                  Returns:
                    The accepted token ids in main-vocab space (including a

@@ -298,14 +298,18 @@ namespace ctranslate2 {
       // ``eot_id`` when generation stopped on EOT.
       //
       // Adaptive K: when ``max_speculative_tokens > min_speculative_tokens``
-      // the number of tokens drafted per round adapts to the recent draft
-      // acceptance (an additive-increase / additive-decrease controller, as
-      // in HF transformers' "heuristic" assisted-generation schedule): a
-      // round where every drafted token is accepted bumps K up, any
-      // rejection nudges it down, clamped to
-      // ``[min_speculative_tokens, max_speculative_tokens]`` and seeded at
-      // ``num_speculative_tokens``.  Pass ``max_speculative_tokens == 0``
-      // (the default) to keep K fixed at ``num_speculative_tokens``.
+      // the number of tokens drafted per round self-tunes to the draft's
+      // acceptance with a symmetric +1/-1 controller -- a round where every
+      // drafted token is accepted bumps K up by one, any rejection nudges it
+      // down by one -- clamped to ``[min_speculative_tokens,
+      // max_speculative_tokens]``.  The controller's K *persists across
+      // calls* (stored on the replica) so that, over a chunked transcription,
+      // it converges to the per-audio equilibrium (where ~half the rounds
+      // fully accept) regardless of the seed.  Pass ``reset_adaptive_state``
+      // on the first chunk of a new audio to re-seed K from
+      // ``num_speculative_tokens``; pass it false on subsequent chunks to
+      // keep converging.  Pass ``max_speculative_tokens == 0`` (the default)
+      // to keep K fixed at ``num_speculative_tokens``.
       std::vector<size_t>
       generate_speculative(WhisperReplica& draft,
                            StorageView main_features,
@@ -318,7 +322,8 @@ namespace ctranslate2 {
                            const std::vector<int32_t>& d2m,
                            const std::vector<int32_t>& m2d,
                            size_t min_speculative_tokens = 0,
-                           size_t max_speculative_tokens = 0);
+                           size_t max_speculative_tokens = 0,
+                           bool reset_adaptive_state = true);
 
     private:
       const std::shared_ptr<const WhisperModel> _model;
@@ -332,6 +337,10 @@ namespace ctranslate2 {
       size_t _n_mels;
       size_t _num_languages;
       bool _is_multilingual;
+
+      // Persistent adaptive-K controller state (see generate_speculative).
+      // <= 0 means "uninitialised": the next adaptive call seeds it.
+      double _spec_k_state = 0.0;
 
       StorageView maybe_encode(StorageView features);
     };
@@ -444,7 +453,8 @@ namespace ctranslate2 {
                            std::vector<int32_t> d2m,
                            std::vector<int32_t> m2d,
                            size_t min_speculative_tokens = 0,
-                           size_t max_speculative_tokens = 0);
+                           size_t max_speculative_tokens = 0,
+                           bool reset_adaptive_state = true);
 
       // Async wrapper for the bulk attention transfer.  Performs the
       // concat + (optional) head-mean on the device that owns the state,

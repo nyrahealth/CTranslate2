@@ -1214,20 +1214,22 @@ namespace ctranslate2 {
         const std::vector<int32_t>& d2m,
         const std::vector<int32_t>& m2d,
         size_t min_speculative_tokens,
-        size_t max_speculative_tokens) {
+        size_t max_speculative_tokens,
+        bool reset_adaptive_state) {
       PROFILE("WhisperReplica::generate_speculative");
 
 #ifdef CT2_WITH_CUDA
       const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
 #endif
 
-      // Adaptive-K controller: up-biased hysteresis.  For a strong, well
-      // matched draft (e.g. large-v2 + turbo) acceptance is the common case,
-      // so K climbs readily on a fully-accepted round (every round, by
-      // K_STEP_UP) but only backs off after DOWN_AFTER *consecutive* rounds
-      // that hit a rejection (by K_STEP_DOWN).  The hysteresis keeps K from
-      // collapsing on isolated rejections while still tracking the per-audio
-      // optimum, and was the best of the sweep (see research/timing
+      // Adaptive-K controller: symmetric +1/-1 with *persistent* state.  A
+      // round where every drafted token is accepted bumps K up by one; any
+      // rejection nudges it down by one.  The equilibrium is therefore the K
+      // at which ~half the rounds fully accept -- a purely acceptance-driven
+      // operating point that needs no hand-tuned window.  Because K persists
+      // across calls (``_spec_k_state``), over a chunked transcription it
+      // converges to that equilibrium regardless of the seed, so the seed
+      // only matters for the very first chunk (see research/timing
       // experiment_adaptive_k.py).  Disabled (fixed K) unless a usable
       // [min, max] window is supplied.
       const bool adaptive =
@@ -1235,16 +1237,18 @@ namespace ctranslate2 {
           && max_speculative_tokens > min_speculative_tokens;
       const size_t k_lo = std::max<size_t>(1, min_speculative_tokens);
       const size_t k_hi = std::max(k_lo, max_speculative_tokens);
-      constexpr double K_STEP_UP = 2.0;    // bump on a fully-accepted round
-      constexpr double K_STEP_DOWN = 1.0;  // nudge after sustained rejection
-      constexpr size_t UP_AFTER = 1;       // accepted rounds before stepping up
-      constexpr size_t DOWN_AFTER = 2;     // consecutive rejections before down
-      size_t acc_run = 0;                  // consecutive fully-accepted rounds
-      size_t rej_run = 0;                  // consecutive rounds with a rejection
+      constexpr double K_STEP_UP = 1.0;    // bump on a fully-accepted round
+      constexpr double K_STEP_DOWN = 1.0;  // nudge on any rejection
       double k_cur = static_cast<double>(num_speculative_tokens);
-      if (adaptive)
+      if (adaptive) {
+        // Persist across chunks: continue from the stored state unless the
+        // caller asked to reset (first chunk of a new audio) or it is still
+        // uninitialised.
+        if (!reset_adaptive_state && _spec_k_state > 0.0)
+          k_cur = _spec_k_state;
         k_cur = std::min(std::max(k_cur, static_cast<double>(k_lo)),
                          static_cast<double>(k_hi));
+      }
       const size_t K = num_speculative_tokens;
 
       // Encode both models once and reuse the encoder output for every
@@ -1394,25 +1398,13 @@ namespace ctranslate2 {
         const bool all_accepted =
             (n_draft_accepted == candidates_main.size()) && !has_correction;
 
-        // Adapt K for the next round based on this round's acceptance, with
-        // up-biased hysteresis (step up after UP_AFTER accepted rounds, step
-        // down only after DOWN_AFTER consecutive rejected rounds).
+        // Adapt K for the next round: symmetric +1 on a fully-accepted round,
+        // -1 on any rejection (converges to the ~50%-full-accept equilibrium).
         if (adaptive) {
-          if (all_accepted) {
-            ++acc_run;
-            rej_run = 0;
-            if (acc_run >= UP_AFTER) {
-              k_cur = std::min(static_cast<double>(k_hi), k_cur + K_STEP_UP);
-              acc_run = 0;
-            }
-          } else {
-            ++rej_run;
-            acc_run = 0;
-            if (rej_run >= DOWN_AFTER) {
-              k_cur = std::max(static_cast<double>(k_lo), k_cur - K_STEP_DOWN);
-              rej_run = 0;
-            }
-          }
+          if (all_accepted)
+            k_cur = std::min(static_cast<double>(k_hi), k_cur + K_STEP_UP);
+          else
+            k_cur = std::max(static_cast<double>(k_lo), k_cur - K_STEP_DOWN);
         }
 
         if (all_accepted) {
@@ -1436,6 +1428,10 @@ namespace ctranslate2 {
           draft_state = std::move(dres.first);
         }
       }
+
+      // Persist the converged K for the next chunk of this audio.
+      if (adaptive)
+        _spec_k_state = k_cur;
 
       return accepted;
     }
@@ -1714,7 +1710,8 @@ namespace ctranslate2 {
         std::vector<int32_t> d2m,
         std::vector<int32_t> m2d,
         size_t min_speculative_tokens,
-        size_t max_speculative_tokens) {
+        size_t max_speculative_tokens,
+        bool reset_adaptive_state) {
       return post<std::vector<size_t>>(
         [&draft_pool,
          main_features = main_features.sync_copy(),
@@ -1727,7 +1724,8 @@ namespace ctranslate2 {
          d2m = std::move(d2m),
          m2d = std::move(m2d),
          min_speculative_tokens,
-         max_speculative_tokens]
+         max_speculative_tokens,
+         reset_adaptive_state]
         (WhisperReplica& replica) mutable {
           // Drive the draft model's replica directly from this (main)
           // worker thread; no job is posted to the draft pool, so both
@@ -1745,7 +1743,8 @@ namespace ctranslate2 {
               d2m,
               m2d,
               min_speculative_tokens,
-              max_speculative_tokens);
+              max_speculative_tokens,
+              reset_adaptive_state);
         });
     }
 
