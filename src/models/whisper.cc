@@ -1212,13 +1212,29 @@ namespace ctranslate2 {
         size_t eot_id,
         const std::vector<size_t>& suppress_tokens,
         const std::vector<int32_t>& d2m,
-        const std::vector<int32_t>& m2d) {
+        const std::vector<int32_t>& m2d,
+        size_t min_speculative_tokens,
+        size_t max_speculative_tokens) {
       PROFILE("WhisperReplica::generate_speculative");
 
 #ifdef CT2_WITH_CUDA
       const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
 #endif
 
+      // Adaptive-K controller (additive increase / additive decrease, à la
+      // HF transformers' "heuristic" schedule).  Disabled (fixed K) unless
+      // a usable [min, max] window is supplied.
+      const bool adaptive =
+          max_speculative_tokens > 0
+          && max_speculative_tokens > min_speculative_tokens;
+      const size_t k_lo = std::max<size_t>(1, min_speculative_tokens);
+      const size_t k_hi = std::max(k_lo, max_speculative_tokens);
+      constexpr double K_STEP_UP = 2.0;    // bump on a fully-accepted round
+      constexpr double K_STEP_DOWN = 1.0;  // nudge on any rejection
+      double k_cur = static_cast<double>(num_speculative_tokens);
+      if (adaptive)
+        k_cur = std::min(std::max(k_cur, static_cast<double>(k_lo)),
+                         static_cast<double>(k_hi));
       const size_t K = num_speculative_tokens;
 
       // Encode both models once and reuse the encoder output for every
@@ -1287,7 +1303,15 @@ namespace ctranslate2 {
           accepted.push_back(main_next);
           break;
         }
-        const size_t draft_n = std::min(K, budget - 1);
+        size_t K_round = K;
+        if (adaptive) {
+          K_round = static_cast<size_t>(k_cur + 0.5);
+          if (K_round < k_lo)
+            K_round = k_lo;
+          if (K_round > k_hi)
+            K_round = k_hi;
+        }
+        const size_t draft_n = std::min(K_round, budget - 1);
 
         // --- Draft phase (greedy, no suppression on the draft model) ---
         std::vector<size_t> candidates_main;
@@ -1359,6 +1383,14 @@ namespace ctranslate2 {
         // --- State management ---
         const bool all_accepted =
             (n_draft_accepted == candidates_main.size()) && !has_correction;
+
+        // Adapt K for the next round based on this round's acceptance.
+        if (adaptive) {
+          if (all_accepted)
+            k_cur = std::min(static_cast<double>(k_hi), k_cur + K_STEP_UP);
+          else
+            k_cur = std::max(static_cast<double>(k_lo), k_cur - K_STEP_DOWN);
+        }
 
         if (all_accepted) {
           if (!candidates_draft.empty())
@@ -1657,7 +1689,9 @@ namespace ctranslate2 {
         size_t eot_id,
         std::vector<size_t> suppress_tokens,
         std::vector<int32_t> d2m,
-        std::vector<int32_t> m2d) {
+        std::vector<int32_t> m2d,
+        size_t min_speculative_tokens,
+        size_t max_speculative_tokens) {
       return post<std::vector<size_t>>(
         [&draft_pool,
          main_features = main_features.sync_copy(),
@@ -1668,7 +1702,9 @@ namespace ctranslate2 {
          eot_id,
          suppress_tokens = std::move(suppress_tokens),
          d2m = std::move(d2m),
-         m2d = std::move(m2d)]
+         m2d = std::move(m2d),
+         min_speculative_tokens,
+         max_speculative_tokens]
         (WhisperReplica& replica) mutable {
           // Drive the draft model's replica directly from this (main)
           // worker thread; no job is posted to the draft pool, so both
@@ -1684,7 +1720,9 @@ namespace ctranslate2 {
               eot_id,
               suppress_tokens,
               d2m,
-              m2d);
+              m2d,
+              min_speculative_tokens,
+              max_speculative_tokens);
         });
     }
 

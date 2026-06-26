@@ -296,6 +296,16 @@ namespace ctranslate2 {
       // exactly matching a non-speculative suppressed decode.  The
       // returned ids are in main-vocab space and include the trailing
       // ``eot_id`` when generation stopped on EOT.
+      //
+      // Adaptive K: when ``max_speculative_tokens > min_speculative_tokens``
+      // the number of tokens drafted per round adapts to the recent draft
+      // acceptance (an additive-increase / additive-decrease controller, as
+      // in HF transformers' "heuristic" assisted-generation schedule): a
+      // round where every drafted token is accepted bumps K up, any
+      // rejection nudges it down, clamped to
+      // ``[min_speculative_tokens, max_speculative_tokens]`` and seeded at
+      // ``num_speculative_tokens``.  Pass ``max_speculative_tokens == 0``
+      // (the default) to keep K fixed at ``num_speculative_tokens``.
       std::vector<size_t>
       generate_speculative(WhisperReplica& draft,
                            StorageView main_features,
@@ -306,7 +316,9 @@ namespace ctranslate2 {
                            size_t eot_id,
                            const std::vector<size_t>& suppress_tokens,
                            const std::vector<int32_t>& d2m,
-                           const std::vector<int32_t>& m2d);
+                           const std::vector<int32_t>& m2d,
+                           size_t min_speculative_tokens = 0,
+                           size_t max_speculative_tokens = 0);
 
     private:
       const std::shared_ptr<const WhisperModel> _model;
@@ -430,7 +442,9 @@ namespace ctranslate2 {
                            size_t eot_id,
                            std::vector<size_t> suppress_tokens,
                            std::vector<int32_t> d2m,
-                           std::vector<int32_t> m2d);
+                           std::vector<int32_t> m2d,
+                           size_t min_speculative_tokens = 0,
+                           size_t max_speculative_tokens = 0);
 
       // Async wrapper for the bulk attention transfer.  Performs the
       // concat + (optional) head-mean on the device that owns the state,
