@@ -1221,16 +1221,26 @@ namespace ctranslate2 {
       const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
 #endif
 
-      // Adaptive-K controller (additive increase / additive decrease, à la
-      // HF transformers' "heuristic" schedule).  Disabled (fixed K) unless
-      // a usable [min, max] window is supplied.
+      // Adaptive-K controller: up-biased hysteresis.  For a strong, well
+      // matched draft (e.g. large-v2 + turbo) acceptance is the common case,
+      // so K climbs readily on a fully-accepted round (every round, by
+      // K_STEP_UP) but only backs off after DOWN_AFTER *consecutive* rounds
+      // that hit a rejection (by K_STEP_DOWN).  The hysteresis keeps K from
+      // collapsing on isolated rejections while still tracking the per-audio
+      // optimum, and was the best of the sweep (see research/timing
+      // experiment_adaptive_k.py).  Disabled (fixed K) unless a usable
+      // [min, max] window is supplied.
       const bool adaptive =
           max_speculative_tokens > 0
           && max_speculative_tokens > min_speculative_tokens;
       const size_t k_lo = std::max<size_t>(1, min_speculative_tokens);
       const size_t k_hi = std::max(k_lo, max_speculative_tokens);
       constexpr double K_STEP_UP = 2.0;    // bump on a fully-accepted round
-      constexpr double K_STEP_DOWN = 1.0;  // nudge on any rejection
+      constexpr double K_STEP_DOWN = 1.0;  // nudge after sustained rejection
+      constexpr size_t UP_AFTER = 1;       // accepted rounds before stepping up
+      constexpr size_t DOWN_AFTER = 2;     // consecutive rejections before down
+      size_t acc_run = 0;                  // consecutive fully-accepted rounds
+      size_t rej_run = 0;                  // consecutive rounds with a rejection
       double k_cur = static_cast<double>(num_speculative_tokens);
       if (adaptive)
         k_cur = std::min(std::max(k_cur, static_cast<double>(k_lo)),
@@ -1384,12 +1394,25 @@ namespace ctranslate2 {
         const bool all_accepted =
             (n_draft_accepted == candidates_main.size()) && !has_correction;
 
-        // Adapt K for the next round based on this round's acceptance.
+        // Adapt K for the next round based on this round's acceptance, with
+        // up-biased hysteresis (step up after UP_AFTER accepted rounds, step
+        // down only after DOWN_AFTER consecutive rejected rounds).
         if (adaptive) {
-          if (all_accepted)
-            k_cur = std::min(static_cast<double>(k_hi), k_cur + K_STEP_UP);
-          else
-            k_cur = std::max(static_cast<double>(k_lo), k_cur - K_STEP_DOWN);
+          if (all_accepted) {
+            ++acc_run;
+            rej_run = 0;
+            if (acc_run >= UP_AFTER) {
+              k_cur = std::min(static_cast<double>(k_hi), k_cur + K_STEP_UP);
+              acc_run = 0;
+            }
+          } else {
+            ++rej_run;
+            acc_run = 0;
+            if (rej_run >= DOWN_AFTER) {
+              k_cur = std::max(static_cast<double>(k_lo), k_cur - K_STEP_DOWN);
+              rej_run = 0;
+            }
+          }
         }
 
         if (all_accepted) {
