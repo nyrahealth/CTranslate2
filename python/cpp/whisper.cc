@@ -145,6 +145,24 @@ namespace ctranslate2 {
         return {state_ptr, std::move(result.second)};
       }
 
+      std::pair<std::vector<std::vector<size_t>>, std::vector<StorageView>>
+      generate_dual_greedy(const StorageView& features,
+                           BatchIds prompts,
+                           size_t max_new_tokens,
+                           size_t eot_id,
+                           std::vector<size_t> suppress_tokens,
+                           bool want_attention) {
+        std::shared_lock lock(_mutex);
+        assert_model_is_ready();
+        return _pool->generate_dual_greedy(
+            features,
+            std::move(prompts),
+            max_new_tokens,
+            eot_id,
+            std::move(suppress_tokens),
+            want_attention).get();
+      }
+
       std::vector<size_t>
       generate_speculative(WhisperWrapper& draft,
                            const StorageView& main_features,
@@ -845,6 +863,59 @@ namespace ctranslate2 {
                    of newly emitted token ids, of length
                    ``len(state.collected_attention)``; the final element will
                    equal ``eot_id`` when generation stopped on EOT.
+             )pbdoc")
+
+        .def("generate_dual_greedy",
+             &WhisperWrapper::generate_dual_greedy,
+             py::arg("features"),
+             py::arg("prompts"),
+             py::kw_only(),
+             py::arg("max_new_tokens"),
+             py::arg("eot_id"),
+             py::arg("suppress_tokens") = std::vector<size_t>{},
+             py::arg("want_attention") = false,
+             py::call_guard<py::gil_scoped_release>(),
+             R"pbdoc(
+                 Greedy-decode several prompts that share the **same** audio in
+                 one batched decoder pass (the encoder runs once and each row
+                 decodes independently).  This is the fast path for producing
+                 e.g. verbatim and intended transcripts -- plus their
+                 word-timing cross-attention -- at close to the cost of a
+                 single decode.
+
+                 The prompts may have different lengths (their continuation
+                 contexts differ).  Whisper's absolute positions make padding
+                 incorrect, so shorter prompts are first advanced with their
+                 own real greedy tokens ("catch-up") until every active row has
+                 the same length, after which the rows decode together in
+                 lockstep.  The output is token-for-token identical to decoding
+                 each prompt on its own with
+                 :meth:`generate_greedy_with_attention` (greedy, same
+                 suppression).
+
+                 Arguments:
+                   features: Mel spectrogram ``[1, n_mels, chunk_length]`` (or
+                     pre-encoded features from :meth:`encode`) for the single
+                     shared audio.
+                   prompts: List of decoder prompt token-id sequences, one per
+                     row (e.g. verbatim then intended).
+                   max_new_tokens: Per-row cap on generated tokens.
+                   eot_id: End-of-text token id; a row stops as soon as it
+                     emits this id (which is included in that row's output).
+                   suppress_tokens: Token ids masked to -inf on the device
+                     before every argmax.  Empty means no suppression.
+                   want_attention: If True, also return per-row head-averaged
+                     post-softmax cross-attention; requires
+                     :meth:`set_alignment_heads` first.
+
+                 Returns:
+                   A tuple ``(sequences_ids, attention)``.  ``sequences_ids`` is
+                   a list of token-id lists (one per prompt, in order; each
+                   ends with ``eot_id`` when that row stopped on EOT).
+                   ``attention`` is a list of CPU :class:`StorageView` matrices
+                   of shape ``[len(sequence_ids_row), F_enc]`` (1-to-1 with the
+                   row's ids) when ``want_attention`` is set, otherwise a list
+                   of empty views.
              )pbdoc")
 
         .def("generate_speculative",

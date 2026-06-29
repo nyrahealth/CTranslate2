@@ -1201,6 +1201,225 @@ namespace ctranslate2 {
       }
     }
 
+    std::pair<std::vector<std::vector<size_t>>, std::vector<StorageView>>
+    WhisperReplica::generate_dual_greedy(
+        StorageView features,
+        const std::vector<std::vector<size_t>>& prompts,
+        size_t max_new_tokens,
+        size_t eot_id,
+        const std::vector<size_t>& suppress_tokens,
+        bool want_attention) {
+      PROFILE("WhisperReplica::generate_dual_greedy");
+      if (want_attention)
+        require_alignment_heads_configured(*_decoder);
+
+      const size_t n_rows = prompts.size();
+      if (n_rows == 0)
+        return {};
+      for (const auto& p : prompts)
+        if (p.empty())
+          throw std::invalid_argument(
+              "generate_dual_greedy: every prompt must be non-empty");
+
+#ifdef CT2_WITH_CUDA
+      const cuda::UseTrueFp16GemmInScope use_true_fp16_gemm(false);
+#endif
+
+      const auto scoped_device_setter = _model->get_scoped_device_setter();
+      const Device device = _decoder->device();
+      const DataType dtype = _decoder->output_type();
+      _decoder->update_output_layer(_model->preferred_size_multiple());
+
+      // Encode the shared audio once; reused for every row.
+      StorageView memory = maybe_encode(std::move(features));  // [1, F, dim]
+
+      // Head-average a single-position attention tensor ``[rows, heads, F]``
+      // to a CPU float32 ``[rows, F]``.
+      auto attn_to_cpu_rows = [&](const StorageView& attention) -> StorageView {
+        StorageView reduced(attention.dtype(), device);
+        ops::Mean(1)(attention, reduced);              // [rows, 1, F]
+        StorageView fp32 = reduced.to(DataType::FLOAT32);
+        StorageView cpu = fp32.to(Device::CPU);        // [rows, 1, F]
+        if (cpu.rank() == 3 && cpu.dim(1) == 1)
+          cpu.squeeze(1);                              // [rows, F]
+        return cpu;
+      };
+
+      // Per-row results (indexed by original prompt order).
+      std::vector<std::vector<size_t>> gen_ids(n_rows);
+      std::vector<std::vector<float>> attn_flat(n_rows);
+      std::vector<bool> finished(n_rows, false);
+      dim_t F_enc = 0;
+
+      size_t target_len = 0;
+      for (const auto& p : prompts)
+        target_len = std::max(target_len, p.size());
+      const dim_t target_step = static_cast<dim_t>(target_len) - 1;
+
+      // Catch-up: decode every row on its own -- exactly as a single-mode
+      // decode would (prompt prefill + incremental greedy steps) -- until its
+      // KV cache reaches ``target_step`` positions.  Rows already at
+      // ``target_len`` need zero extra steps.  Keeping each row's
+      // incrementally-built KV (rather than re-prefilling an extended prompt)
+      // is what makes the batched result bit-identical to a per-mode decode:
+      // the catch-up tokens' cache is produced by the same forward_step path
+      // the reference uses, so no forward_prompt-vs-incremental drift creeps
+      // in.  A row that emits EOT during catch-up is finished and excluded.
+      std::vector<size_t> active;                          // original indices
+      std::vector<layers::DecoderState> states;           // per active row
+      std::vector<size_t> next_feed;                       // token at target_step
+
+      for (size_t i = 0; i < n_rows; ++i) {
+        const auto& prompt = prompts[i];
+
+        layers::DecoderState state = _decoder->initial_state();
+        state.emplace("memory", StorageView(memory));      // own copy of memory
+        dim_t cur_step = 0;
+        if (prompt.size() > 1) {
+          std::vector<std::vector<size_t>> pb = {
+            std::vector<size_t>(prompt.begin(), prompt.end() - 1)
+          };
+          const StorageView inputs = layers::make_sequence_inputs(pb, device);
+          _decoder->forward_prompt(inputs, state);
+          cur_step = static_cast<dim_t>(prompt.size()) - 1;
+        }
+
+        size_t cur_token = prompt.back();
+        bool hit_eot = false;
+        while (cur_step < target_step) {
+          StorageView ids({1}, int32_t(cur_token), device);
+          StorageView logits(dtype, device);
+          StorageView attention(dtype, device);
+          (*_decoder)(cur_step, ids, state, &logits,
+                      want_attention ? &attention : nullptr);
+          cur_step++;
+          const size_t picked = argmax_suppressed_device(logits, suppress_tokens);
+          gen_ids[i].push_back(picked);
+          if (want_attention) {
+            StorageView row_cpu = attn_to_cpu_rows(attention);  // [1, F]
+            if (F_enc == 0)
+              F_enc = row_cpu.dim(-1);
+            const float* ptr = row_cpu.data<float>();
+            attn_flat[i].insert(attn_flat[i].end(), ptr, ptr + row_cpu.dim(-1));
+          }
+          if (picked == eot_id) { hit_eot = true; break; }
+          cur_token = picked;
+        }
+
+        if (hit_eot) {
+          finished[i] = true;            // fully decoded within catch-up
+        } else {
+          active.push_back(i);
+          states.push_back(std::move(state));
+          next_feed.push_back(cur_token);
+        }
+      }
+
+      const size_t A = active.size();
+      if (A > 0) {
+        // Fuse the per-row caches into one batched decoder state by
+        // concatenating every cache tensor along the batch axis.  All rows
+        // are at ``target_step`` positions, the audio (memory) is shared, so
+        // each key has matching shape across rows.
+        layers::DecoderState bstate;
+        {
+          const ops::Concat concat_op(0);
+          for (const auto& kv : states[0]) {
+            const std::string& key = kv.first;
+            std::vector<const StorageView*> ins;
+            ins.reserve(A);
+            for (auto& st : states)
+              ins.push_back(&st.at(key));
+            StorageView out(kv.second.dtype(), device);
+            if (A == 1)
+              out = *ins[0];
+            else
+              concat_op(ins, out);
+            bstate.emplace(key, std::move(out));
+          }
+        }
+
+        dim_t cur_step = target_step;
+
+        std::vector<size_t> cur(A);
+        std::vector<bool> bfin(A, false);
+        for (size_t a = 0; a < A; ++a)
+          cur[a] = next_feed[a];
+
+        for (size_t t = 0; t < max_new_tokens; ++t) {
+          bool any_active = false;
+          for (size_t a = 0; a < A; ++a)
+            if (!bfin[a]) { any_active = true; break; }
+          if (!any_active)
+            break;
+
+          std::vector<int32_t> cur_i32(A);
+          for (size_t a = 0; a < A; ++a)
+            cur_i32[a] = static_cast<int32_t>(cur[a]);
+          StorageView ids_cpu({static_cast<dim_t>(A)}, cur_i32);
+          StorageView ids = ids_cpu.to(device);
+
+          StorageView logits(dtype, device);
+          StorageView attention(dtype, device);
+          (*_decoder)(cur_step, ids, bstate, &logits,
+                      want_attention ? &attention : nullptr);
+          cur_step++;
+
+          if (!suppress_tokens.empty()) {
+            DisableTokens disable(logits);
+            for (const size_t tid : suppress_tokens)
+              disable.add(static_cast<dim_t>(tid));
+            disable.apply();
+          }
+
+          StorageView best_ids(DataType::INT32, device);
+          StorageView best_scores(logits.dtype(), device);
+          ops::TopK(1)(logits, best_scores, best_ids);          // [A, 1]
+          StorageView best_cpu(DataType::INT32);
+          best_cpu.copy_from(best_ids);
+
+          StorageView attn_cpu;                                 // [A, F]
+          if (want_attention) {
+            attn_cpu = attn_to_cpu_rows(attention);
+            if (F_enc == 0)
+              F_enc = attn_cpu.dim(-1);
+          }
+
+          for (size_t a = 0; a < A; ++a) {
+            if (bfin[a])
+              continue;
+            const size_t i = active[a];
+            const size_t picked = static_cast<size_t>(best_cpu.at<int32_t>(a));
+            gen_ids[i].push_back(picked);
+            if (want_attention) {
+              const float* row = attn_cpu.index<float>({static_cast<dim_t>(a), 0});
+              attn_flat[i].insert(attn_flat[i].end(), row, row + F_enc);
+            }
+            if (picked == eot_id) {
+              bfin[a] = true;
+            } else {
+              cur[a] = picked;
+              if (gen_ids[i].size() >= max_new_tokens)
+                bfin[a] = true;
+            }
+          }
+        }
+      }
+
+      // Assemble per-row attention matrices (or empty views).
+      std::vector<StorageView> attn_out(n_rows);
+      if (want_attention) {
+        for (size_t i = 0; i < n_rows; ++i) {
+          const dim_t n = static_cast<dim_t>(gen_ids[i].size());
+          if (n == 0 || F_enc == 0)
+            continue;
+          attn_out[i] = StorageView({n, F_enc}, attn_flat[i]);
+        }
+      }
+
+      return {std::move(gen_ids), std::move(attn_out)};
+    }
+
     std::vector<size_t>
     WhisperReplica::generate_speculative(
         WhisperReplica& draft,
@@ -1698,6 +1917,36 @@ namespace ctranslate2 {
               eot_id,
               suppress_tokens,
               ban_first_tokens);
+        });
+    }
+
+    std::future<std::pair<std::vector<std::vector<size_t>>, std::vector<StorageView>>>
+    Whisper::generate_dual_greedy(
+        StorageView features,
+        std::vector<std::vector<size_t>> prompts,
+        size_t max_new_tokens,
+        size_t eot_id,
+        std::vector<size_t> suppress_tokens,
+        bool want_attention) {
+      auto heads = get_alignment_heads_copy();
+      return post<std::pair<std::vector<std::vector<size_t>>, std::vector<StorageView>>>(
+        [features = features.sync_copy(),
+         prompts = std::move(prompts),
+         max_new_tokens,
+         eot_id,
+         suppress_tokens = std::move(suppress_tokens),
+         want_attention,
+         heads = std::move(heads)]
+        (WhisperReplica& replica) mutable {
+          if (want_attention)
+            replica.set_alignment_heads(heads);
+          return replica.generate_dual_greedy(
+              std::move(features),
+              prompts,
+              max_new_tokens,
+              eot_id,
+              suppress_tokens,
+              want_attention);
         });
     }
 

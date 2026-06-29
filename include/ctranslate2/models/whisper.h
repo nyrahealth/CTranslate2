@@ -274,6 +274,40 @@ namespace ctranslate2 {
                                      const std::vector<size_t>& suppress_tokens,
                                      const std::vector<size_t>& ban_first_tokens);
 
+      // Greedy-decode several prompts that share the **same** audio in a
+      // single batched decoder pass -- the encoder runs once and each row
+      // decodes independently.  Used to produce e.g. verbatim and intended
+      // transcripts (plus their word-timing cross-attention) at close to the
+      // cost of one decode.
+      //
+      // The prompts may have *different* lengths (their continuation
+      // contexts differ).  Because Whisper uses absolute positions, padding
+      // cannot equalise them; instead the shorter prompts are advanced with
+      // their own real greedy tokens ("catch-up") until every active row sits
+      // at the same length, after which the rows are decoded together in
+      // lockstep.  The result is token-for-token identical to decoding each
+      // prompt on its own with ``generate_greedy_with_attention`` (greedy,
+      // same suppression).  A row that emits ``eot_id`` during catch-up is
+      // finished immediately and excluded from the batched phase.
+      //
+      // ``suppress_tokens`` (main-vocab ids) are masked on the device before
+      // every argmax.  Output ids are per row, in prompt order, and include
+      // the trailing ``eot_id`` when that row stopped on EOT (matching
+      // ``generate_greedy_with_attention``).
+      //
+      // ``want_attention``: when true, requires ``set_alignment_heads([...])``
+      // first and returns, per row, the head-averaged post-softmax
+      // cross-attention as a CPU ``[len(ids_row), F_enc]`` float32 matrix
+      // (1-to-1 with that row's ids).  When false the second element is a
+      // list of empty StorageViews.
+      std::pair<std::vector<std::vector<size_t>>, std::vector<StorageView>>
+      generate_dual_greedy(StorageView features,
+                           const std::vector<std::vector<size_t>>& prompts,
+                           size_t max_new_tokens,
+                           size_t eot_id,
+                           const std::vector<size_t>& suppress_tokens,
+                           bool want_attention);
+
       // Runs the entire *strict* speculative-decoding loop natively inside
       // a single thread-pool job: this replica is the verifier ("main"),
       // ``draft`` proposes ``num_speculative_tokens`` tokens per round,
@@ -435,6 +469,17 @@ namespace ctranslate2 {
                                      size_t eot_id,
                                      std::vector<size_t> suppress_tokens,
                                      std::vector<size_t> ban_first_tokens);
+
+      // Async wrapper around ``WhisperReplica::generate_dual_greedy``.  The
+      // whole batched (catch-up + lockstep) decode runs inside one job, so
+      // the Python caller pays a single round-trip for both transcripts.
+      std::future<std::pair<std::vector<std::vector<size_t>>, std::vector<StorageView>>>
+      generate_dual_greedy(StorageView features,
+                           std::vector<std::vector<size_t>> prompts,
+                           size_t max_new_tokens,
+                           size_t eot_id,
+                           std::vector<size_t> suppress_tokens,
+                           bool want_attention);
 
       // Async wrapper around ``WhisperReplica::generate_speculative``.
       // The whole strict speculative loop runs inside one job on *this*
