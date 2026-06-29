@@ -1223,10 +1223,13 @@ namespace ctranslate2 {
 #endif
 
       // Adaptive-K controller: symmetric +1/-1 with *persistent* state.  A
-      // round where every drafted token is accepted bumps K up by one; any
-      // rejection nudges it down by one.  The equilibrium is therefore the K
-      // at which ~half the rounds fully accept -- a purely acceptance-driven
-      // operating point that needs no hand-tuned window.  Because K persists
+      // round where every drafted token is accepted bumps K up by two; any
+      // rejection nudges it down by one (AIMD, as in HF assisted decoding).
+      // The equilibrium is therefore the K at which ~1/3 of the rounds fully
+      // accept -- a purely acceptance-driven operating point that needs no
+      // hand-tuned window.  The up-bias keeps K near the cap when acceptance
+      // is high (the wall-time optimum for large-v2+turbo) while still backing
+      // off on genuinely low-acceptance audio.  Because K persists
       // across calls (``_spec_k_state``), over a chunked transcription it
       // converges to that equilibrium regardless of the seed, so the seed
       // only matters for the very first chunk (see research/timing
@@ -1237,7 +1240,7 @@ namespace ctranslate2 {
           && max_speculative_tokens > min_speculative_tokens;
       const size_t k_lo = std::max<size_t>(1, min_speculative_tokens);
       const size_t k_hi = std::max(k_lo, max_speculative_tokens);
-      constexpr double K_STEP_UP = 1.0;    // bump on a fully-accepted round
+      constexpr double K_STEP_UP = 2.0;    // climb on a fully-accepted round
       constexpr double K_STEP_DOWN = 1.0;  // nudge on any rejection
       double k_cur = static_cast<double>(num_speculative_tokens);
       if (adaptive) {
@@ -1398,8 +1401,9 @@ namespace ctranslate2 {
         const bool all_accepted =
             (n_draft_accepted == candidates_main.size()) && !has_correction;
 
-        // Adapt K for the next round: symmetric +1 on a fully-accepted round,
-        // -1 on any rejection (converges to the ~50%-full-accept equilibrium).
+        // Adapt K for the next round: AIMD +2 on a fully-accepted round, -1 on
+        // any rejection (converges to the ~1/3-full-accept equilibrium, biased
+        // toward the cap when acceptance is high).
         if (adaptive) {
           if (all_accepted)
             k_cur = std::min(static_cast<double>(k_hi), k_cur + K_STEP_UP);
