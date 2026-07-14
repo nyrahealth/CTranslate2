@@ -1,118 +1,115 @@
 name: Build and publish wheels
 
+# Release pipeline for the ctranslate2-crisperwhisper fork.
+#
+# Reuses upstream's cibuildwheel recipe (python/tools/prepare_build_environment_linux.sh):
+# manylinux_2_28 container, CUDA 12.8 with CUDA_DYNAMIC_LOADING=ON (libcublas is
+# dlopen'd at runtime, so wheels stay small and also run on CPU-only machines)
+# and CUDA_ARCH_LIST="Common" (sm_50..sm_90 + PTX forward-compat for newer GPUs).
+# One wheel per CPython version, Linux x86_64.
+#
+# Publishing uses PyPI Trusted Publishing (OIDC) — configure the publisher on
+# https://pypi.org/manage/account/publishing/ for project
+# "ctranslate2-crisperwhisper", repo "nyrahealth/CTranslate2", workflow
+# "build-wheels.yml", environment "pypi" (works pre-registration as a
+# "pending publisher" for the first upload).
+
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch:
 
-permissions:
-  contents: write
-
-env:
-  CTRANSLATE2_VERSION: "4.7.1.post1"
-
 jobs:
-  build-cuda-wheel:
-    name: "Build CUDA wheel (Linux x86_64)"
-    runs-on: ubuntu-22.04
-    container:
-      image: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install system dependencies
-        run: |
-          apt-get update && apt-get install -y --no-install-recommends \
-            cmake g++ git python3 python3-pip python3-dev python3-venv \
-            libopenblas-dev wget patchelf
-          python3 -m pip install --upgrade pip setuptools wheel
-
-      - name: Build C++ library
-        run: |
-          mkdir build && cd build
-          cmake .. \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DWITH_CUDA=ON \
-            -DWITH_CUDNN=ON \
-            -DOPENSSL_ROOT_DIR=/usr \
-            -DCMAKE_INSTALL_PREFIX=/usr/local \
-            -DBUILD_SHARED_LIBS=ON
-          make -j$(nproc)
-          make install
-          ldconfig
-
-      - name: Build Python wheel
-        working-directory: python
-        run: |
-          pip install pybind11==2.11.1 auditwheel
-          CTRANSLATE2_ROOT=/usr/local python3 setup.py bdist_wheel
-          # Bundle shared libs into the wheel
-          auditwheel repair dist/*.whl \
-            --plat manylinux_2_35_x86_64 \
-            -w dist/repaired/
-          ls -la dist/repaired/
-
-      - name: Upload wheel artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: cuda-wheel
-          path: python/dist/repaired/*.whl
-
-  build-cpu-wheel:
-    name: "Build CPU wheel (Linux x86_64)"
+  build-wheels:
+    name: Build wheels (Linux x86_64, CUDA)
     runs-on: ubuntu-22.04
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends \
-            cmake g++ libopenblas-dev patchelf
-          python3 -m pip install --upgrade pip setuptools wheel
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v3.2.1
+        with:
+          package-dir: python
+          output-dir: python/wheelhouse
+        env:
+          CIBW_ENVIRONMENT_PASS_LINUX: CIBW_ARCHS
+          CIBW_BEFORE_ALL_LINUX: python/tools/prepare_build_environment_linux.sh
+          CIBW_BEFORE_BUILD: pip install -r python/install_requirements.txt
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_ARCHS: x86_64
+          # CPython only; crisperwhisper needs >=3.10 but the fork itself
+          # follows upstream's >=3.9.
+          CIBW_SKIP: "pp* *-musllinux_*"
 
-      - name: Build C++ library
-        run: |
-          mkdir build && cd build
-          cmake .. \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DWITH_CUDA=OFF \
-            -DCMAKE_INSTALL_PREFIX=/usr/local \
-            -DBUILD_SHARED_LIBS=ON
-          make -j$(nproc)
-          sudo make install
-          sudo ldconfig
-
-      - name: Build Python wheel
-        working-directory: python
-        run: |
-          pip install pybind11==2.11.1 auditwheel
-          CTRANSLATE2_ROOT=/usr/local python3 setup.py bdist_wheel
-          auditwheel repair dist/*.whl \
-            --plat manylinux_2_35_x86_64 \
-            -w dist/repaired/
-          ls -la dist/repaired/
-
-      - name: Upload wheel artifact
+      - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: cpu-wheel
-          path: python/dist/repaired/*.whl
+          name: wheels
+          path: python/wheelhouse/*.whl
+
+  smoke-test:
+    name: Smoke test (fork APIs present)
+    needs: [build-wheels]
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.13"]
+
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Download wheels
+        uses: actions/download-artifact@v4
+        with:
+          name: wheels
+          path: dist/
+
+      - name: Install wheel on a clean machine
+        run: |
+          pip install dist/*cp$(python -c 'import sys; print("%d%d" % sys.version_info[:2])')*manylinux*.whl
+
+      # Guards against re-publishing a build without the CrisperWhisper
+      # speculative/dual decoding APIs (the 4.7.1.post1 mistake).
+      - name: Verify fork APIs
+        run: |
+          python - <<'EOF'
+          import ctranslate2
+
+          print("version:", ctranslate2.__version__)
+          whisper = ctranslate2.models.Whisper
+          required = (
+              "prefill",
+              "forward_step_greedy",
+              "forward_batch_greedy",
+              "generate_dual_greedy",
+          )
+          missing = [m for m in required if not hasattr(whisper, m)]
+          assert not missing, f"wheel is missing fork APIs: {missing}"
+          print("fork APIs present:", ", ".join(required))
+          EOF
 
   publish:
     name: Publish to GitHub Release & PyPI
-    needs: [build-cuda-wheel, build-cpu-wheel]
+    needs: [build-wheels, smoke-test]
     runs-on: ubuntu-22.04
     if: startsWith(github.ref, 'refs/tags/v')
+    environment: pypi
+    permissions:
+      contents: write
+      id-token: write
 
     steps:
-      - name: Download all wheel artifacts
+      - name: Download wheels
         uses: actions/download-artifact@v4
         with:
+          name: wheels
           path: dist/
-          merge-multiple: true
 
       - name: List wheels
         run: ls -la dist/
@@ -123,9 +120,12 @@ jobs:
           files: dist/*.whl
           generate_release_notes: true
 
+      # Trusted Publishing: no token, authenticated via the job's OIDC
+      # identity + the "pypi" environment. Wheels only — no sdist, a source
+      # build without the prebuilt C++ library fails confusingly (upstream
+      # publishes no sdist either).
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
-          password: ${{ secrets.PYPI_API_TOKEN }}
           skip-existing: true
