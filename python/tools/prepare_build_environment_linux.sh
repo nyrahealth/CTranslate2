@@ -66,7 +66,12 @@ mkdir build-release && cd build-release
 if [ "$CIBW_ARCHS" == "aarch64" ]; then
     cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_CLI=OFF -DWITH_MKL=OFF -DOPENMP_RUNTIME=COMP -DCMAKE_PREFIX_PATH="/opt/OpenBLAS" -DWITH_OPENBLAS=ON -DWITH_RUY=ON ..
 else
-    cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-msse4.1" -DBUILD_CLI=OFF -DWITH_DNNL=ON -DOPENMP_RUNTIME=COMP -DWITH_CUDA=ON -DWITH_CUDNN=OFF -DCUDA_DYNAMIC_LOADING=ON -DCUDA_NVCC_FLAGS="-Xfatbin=-compress-all" -DCUDA_ARCH_LIST="Common"  -DWITH_TENSOR_PARALLEL=ON ..
+    # Explicit arch list instead of "Common": cmake 3.22's arch table stops at
+    # sm_86, so "Common" ships no SASS for Ada (8.9) or Hopper (9.0) and only
+    # compute_86 PTX — which drivers older than the build toolchain (CUDA 12.8)
+    # refuse to JIT (cudaErrorUnsupportedPtxVersion, seen on H100 + driver 535).
+    # 9.0+PTX embeds compute_90 PTX for newer archs (Blackwell drivers can JIT it).
+    cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-msse4.1" -DBUILD_CLI=OFF -DWITH_DNNL=ON -DOPENMP_RUNTIME=COMP -DWITH_CUDA=ON -DWITH_CUDNN=OFF -DCUDA_DYNAMIC_LOADING=ON -DCUDA_NVCC_FLAGS="-Xfatbin=-compress-all" -DCUDA_ARCH_LIST="6.0;6.1;7.0;7.5;8.0;8.6;8.9;9.0+PTX"  -DWITH_TENSOR_PARALLEL=ON ..
 fi
 
 VERBOSE=1 make -j$(nproc) install
