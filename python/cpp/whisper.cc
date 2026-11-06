@@ -130,7 +130,8 @@ namespace ctranslate2 {
                                      size_t max_new_tokens,
                                      size_t eot_id,
                                      std::vector<size_t> suppress_tokens,
-                                     std::vector<size_t> ban_first_tokens) {
+                                     std::vector<size_t> ban_first_tokens,
+                                     bool return_token_logprobs) {
         std::shared_lock lock(_mutex);
         assert_model_is_ready();
         auto result = _pool->generate_greedy_with_attention(
@@ -139,28 +140,40 @@ namespace ctranslate2 {
             max_new_tokens,
             eot_id,
             std::move(suppress_tokens),
-            std::move(ban_first_tokens)).get();
+            std::move(ban_first_tokens),
+            return_token_logprobs).get();
         auto state_ptr = std::make_shared<models::WhisperDecoderState>(
             std::move(result.first));
         return {state_ptr, std::move(result.second)};
       }
 
-      std::pair<std::vector<std::vector<size_t>>, std::vector<StorageView>>
+      py::tuple
       generate_dual_greedy(const StorageView& features,
                            BatchIds prompts,
                            size_t max_new_tokens,
                            size_t eot_id,
                            std::vector<size_t> suppress_tokens,
-                           bool want_attention) {
-        std::shared_lock lock(_mutex);
-        assert_model_is_ready();
-        return _pool->generate_dual_greedy(
-            features,
-            std::move(prompts),
-            max_new_tokens,
-            eot_id,
-            std::move(suppress_tokens),
-            want_attention).get();
+                           bool want_attention,
+                           bool return_token_logprobs) {
+        models::WhisperDualGreedyResult result;
+        {
+          py::gil_scoped_release release;
+          std::shared_lock lock(_mutex);
+          assert_model_is_ready();
+          result = _pool->generate_dual_greedy(
+              features,
+              std::move(prompts),
+              max_new_tokens,
+              eot_id,
+              std::move(suppress_tokens),
+              want_attention,
+              return_token_logprobs).get();
+        }
+        if (return_token_logprobs)
+          return py::make_tuple(std::move(result.ids),
+                                std::move(result.attention),
+                                std::move(result.token_logprobs));
+        return py::make_tuple(std::move(result.ids), std::move(result.attention));
       }
 
       std::vector<size_t>
@@ -315,7 +328,8 @@ namespace ctranslate2 {
                  Truncate the KV cache to keep only the first ``target_step`` decode steps.
 
                  Slices self-attention key/value tensors along the time dimension,
-                 trims the collected cross-attention buffer to match, and resets
+                 trims the collected cross-attention and log-probability buffers
+                 to match, and resets
                  the internal step counter.  Much cheaper than a full re-prefill
                  when rolling back after a speculative-decoding rejection or a
                  hallucination-repair rewind.
@@ -343,6 +357,24 @@ namespace ctranslate2 {
                 The list is empty if attention extraction was never enabled or
                 if it has been truncated all the way back by
                 :meth:`truncate_to_step`.
+            )pbdoc")
+
+        .def_property_readonly(
+            "collected_logprobs",
+            [](const models::WhisperDecoderState& self) {
+              return self.collected_logprobs;
+            },
+            R"pbdoc(
+                Per-step log-probability of each emitted token, as a list of
+                floats.
+
+                Filled by :meth:`Whisper.generate_greedy_with_attention` with
+                ``return_token_logprobs=True``, one value per returned id
+                (including a final EOT).  Entry ``k`` is
+                ``log_softmax(raw_logits_k)[ids[k]]`` over the full vocabulary,
+                computed before ``suppress_tokens`` / ``ban_first_tokens`` are
+                applied, so it matches a teacher-forced pass over the same ids.
+                Empty otherwise.  Trimmed by :meth:`truncate_to_step`.
             )pbdoc")
 
         .def("__repr__", [](const models::WhisperDecoderState& s) {
@@ -824,6 +856,7 @@ namespace ctranslate2 {
              py::arg("eot_id"),
              py::arg("suppress_tokens") = std::vector<size_t>{},
              py::arg("ban_first_tokens") = std::vector<size_t>{},
+             py::arg("return_token_logprobs") = false,
              py::call_guard<py::gil_scoped_release>(),
              R"pbdoc(
                  Run a full greedy decode segment with per-step cross-attention
@@ -855,6 +888,11 @@ namespace ctranslate2 {
                    ban_first_tokens: Token ids to mask out **only at the very
                      first** generated step.  Used by hallucination-repair to
                      force the model away from the loop-starting token.
+                   return_token_logprobs: Also fill
+                     ``state.collected_logprobs`` with the log-probability of
+                     each emitted token under the raw (unmasked) logits.  The
+                     log-softmax runs on the device and the values are copied
+                     to the host once per call.
 
                  Returns:
                    A tuple ``(state, generated)``.  ``state`` is the new
@@ -874,7 +912,7 @@ namespace ctranslate2 {
              py::arg("eot_id"),
              py::arg("suppress_tokens") = std::vector<size_t>{},
              py::arg("want_attention") = false,
-             py::call_guard<py::gil_scoped_release>(),
+             py::arg("return_token_logprobs") = false,
              R"pbdoc(
                  Greedy-decode several prompts that share the **same** audio in
                  one batched decoder pass (the encoder runs once and each row
@@ -907,6 +945,9 @@ namespace ctranslate2 {
                    want_attention: If True, also return per-row head-averaged
                      post-softmax cross-attention; requires
                      :meth:`set_alignment_heads` first.
+                   return_token_logprobs: If True, also return per-row token
+                     log-probabilities under the raw (unmasked) logits, as
+                     :meth:`generate_greedy_with_attention` does.
 
                  Returns:
                    A tuple ``(sequences_ids, attention)``.  ``sequences_ids`` is
@@ -915,7 +956,9 @@ namespace ctranslate2 {
                    ``attention`` is a list of CPU :class:`StorageView` matrices
                    of shape ``[len(sequence_ids_row), F_enc]`` (1-to-1 with the
                    row's ids) when ``want_attention`` is set, otherwise a list
-                   of empty views.
+                   of empty views.  With ``return_token_logprobs`` the tuple
+                   has a third element: one list of floats per row, 1-to-1
+                   with that row's ids.
              )pbdoc")
 
         .def("generate_speculative",

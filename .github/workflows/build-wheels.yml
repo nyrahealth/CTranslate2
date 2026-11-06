@@ -91,7 +91,11 @@ jobs:
           )
           missing = [m for m in required if not hasattr(whisper, m)]
           assert not missing, f"wheel is missing fork APIs: {missing}"
-          print("fork APIs present:", ", ".join(required))
+          state_cls = ctranslate2.models.WhisperDecoderState
+          assert hasattr(state_cls, "collected_logprobs"), (
+              "wheel is missing WhisperDecoderState.collected_logprobs"
+          )
+          print("fork APIs present:", ", ".join(required), "+ collected_logprobs")
           EOF
 
   publish:

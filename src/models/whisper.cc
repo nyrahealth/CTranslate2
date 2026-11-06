@@ -5,7 +5,9 @@
 #include "ctranslate2/decoding.h"
 #include "ctranslate2/decoding_utils.h"
 #include "ctranslate2/ops/concat.h"
+#include "ctranslate2/ops/gather.h"
 #include "ctranslate2/ops/mean.h"
+#include "ctranslate2/ops/softmax.h"
 #include "ctranslate2/ops/topk.h"
 #include "ctranslate2/ops/slide.h"
 
@@ -849,6 +851,14 @@ namespace ctranslate2 {
         else
           collected_attention.resize(static_cast<size_t>(kept));
       }
+      if (!collected_logprobs.empty()) {
+        const dim_t kept = static_cast<dim_t>(collected_logprobs.size())
+                           - steps_to_drop;
+        if (kept <= 0)
+          collected_logprobs.clear();
+        else
+          collected_logprobs.resize(static_cast<size_t>(kept));
+      }
       current_step = target_step;
     }
 
@@ -1087,7 +1097,8 @@ namespace ctranslate2 {
         size_t max_new_tokens,
         size_t eot_id,
         const std::vector<size_t>& suppress_tokens,
-        const std::vector<size_t>& ban_first_tokens) {
+        const std::vector<size_t>& ban_first_tokens,
+        bool return_token_logprobs) {
       PROFILE("WhisperReplica::generate_greedy_with_attention");
       require_alignment_heads_configured(*_decoder);
 
@@ -1126,6 +1137,11 @@ namespace ctranslate2 {
       std::vector<size_t> generated;
       generated.reserve(max_new_tokens);
 
+      // Device-side ``[1, 1]`` log-probabilities, one per step.
+      std::vector<StorageView> step_logprobs;
+      if (return_token_logprobs)
+        step_logprobs.reserve(max_new_tokens);
+
       size_t cur_token = prompt.back();
 
       for (size_t step = 0; step < max_new_tokens; ++step) {
@@ -1135,6 +1151,12 @@ namespace ctranslate2 {
         (*_decoder)(wds.current_step, ids, wds.state, &logits, &attention);
         wds.current_step++;
         wds.collected_attention.emplace_back(std::move(attention));
+
+        // The log-softmax must see the raw logits: the masking below is
+        // in place.
+        StorageView log_probs(DataType::FLOAT32, device);
+        if (return_token_logprobs)
+          ops::LogSoftMax()(logits.to_float32(), log_probs);
 
         // Mask suppressed tokens (and the loop-starting "ban" tokens on
         // step 0 only) directly on the device before argmax.
@@ -1153,6 +1175,12 @@ namespace ctranslate2 {
         StorageView best_scores(logits.dtype(), device);
         ops::TopK(1)(logits, best_scores, best_ids);
 
+        if (return_token_logprobs) {
+          StorageView picked_logprob(DataType::FLOAT32, device);
+          ops::Gather(-1, 1)(log_probs, best_ids, picked_logprob);
+          step_logprobs.emplace_back(std::move(picked_logprob));
+        }
+
         StorageView best_ids_cpu(DataType::INT32);
         best_ids_cpu.copy_from(best_ids);
         const size_t picked = static_cast<size_t>(
@@ -1162,6 +1190,18 @@ namespace ctranslate2 {
         if (picked == eot_id)
           break;
         cur_token = picked;
+      }
+
+      if (!step_logprobs.empty()) {
+        std::vector<const StorageView*> parts;
+        parts.reserve(step_logprobs.size());
+        for (const auto& lp : step_logprobs)
+          parts.push_back(&lp);
+        StorageView stacked(DataType::FLOAT32, device);
+        ops::Concat(0)(parts, stacked);  // [n_steps, 1]
+        const StorageView stacked_cpu = stacked.to(Device::CPU);
+        const float* values = stacked_cpu.data<float>();
+        wds.collected_logprobs.assign(values, values + stacked_cpu.size());
       }
 
       return {std::move(wds), std::move(generated)};
@@ -1201,14 +1241,15 @@ namespace ctranslate2 {
       }
     }
 
-    std::pair<std::vector<std::vector<size_t>>, std::vector<StorageView>>
+    WhisperDualGreedyResult
     WhisperReplica::generate_dual_greedy(
         StorageView features,
         const std::vector<std::vector<size_t>>& prompts,
         size_t max_new_tokens,
         size_t eot_id,
         const std::vector<size_t>& suppress_tokens,
-        bool want_attention) {
+        bool want_attention,
+        bool return_token_logprobs) {
       PROFILE("WhisperReplica::generate_dual_greedy");
       if (want_attention)
         require_alignment_heads_configured(*_decoder);
@@ -1245,8 +1286,23 @@ namespace ctranslate2 {
         return cpu;
       };
 
+      // Log-softmax of the raw logits, taken before the in-place masking.
+      auto raw_log_probs = [&](const StorageView& logits) -> StorageView {
+        StorageView log_probs(DataType::FLOAT32, device);
+        ops::LogSoftMax()(logits.to_float32(), log_probs);
+        return log_probs;
+      };
+      // ``log_probs[r][ids[r]]`` for every row, on the CPU as ``[rows, 1]``.
+      auto gather_to_cpu = [&](const StorageView& log_probs,
+                               const StorageView& ids) -> StorageView {
+        StorageView picked(DataType::FLOAT32, device);
+        ops::Gather(-1, 1)(log_probs, ids, picked);
+        return picked.to(Device::CPU);
+      };
+
       // Per-row results (indexed by original prompt order).
       std::vector<std::vector<size_t>> gen_ids(n_rows);
+      std::vector<std::vector<float>> logprobs(n_rows);
       std::vector<std::vector<float>> attn_flat(n_rows);
       std::vector<bool> finished(n_rows, false);
       dim_t F_enc = 0;
@@ -1293,8 +1349,16 @@ namespace ctranslate2 {
           (*_decoder)(cur_step, ids, state, &logits,
                       want_attention ? &attention : nullptr);
           cur_step++;
+          StorageView log_probs;
+          if (return_token_logprobs)
+            log_probs = raw_log_probs(logits);
           const size_t picked = argmax_suppressed_device(logits, suppress_tokens);
           gen_ids[i].push_back(picked);
+          if (return_token_logprobs) {
+            const StorageView picked_id({1, 1}, int32_t(picked), device);
+            logprobs[i].push_back(
+                gather_to_cpu(log_probs, picked_id).scalar_at<float>({0, 0}));
+          }
           if (want_attention) {
             StorageView row_cpu = attn_to_cpu_rows(attention);  // [1, F]
             if (F_enc == 0)
@@ -1365,6 +1429,10 @@ namespace ctranslate2 {
                       want_attention ? &attention : nullptr);
           cur_step++;
 
+          StorageView log_probs;
+          if (return_token_logprobs)
+            log_probs = raw_log_probs(logits);
+
           if (!suppress_tokens.empty()) {
             DisableTokens disable(logits);
             for (const size_t tid : suppress_tokens)
@@ -1377,6 +1445,9 @@ namespace ctranslate2 {
           ops::TopK(1)(logits, best_scores, best_ids);          // [A, 1]
           StorageView best_cpu(DataType::INT32);
           best_cpu.copy_from(best_ids);
+          StorageView step_logprobs_cpu;                        // [A, 1]
+          if (return_token_logprobs)
+            step_logprobs_cpu = gather_to_cpu(log_probs, best_ids);
 
           StorageView attn_cpu;                                 // [A, F]
           if (want_attention) {
@@ -1391,6 +1462,8 @@ namespace ctranslate2 {
             const size_t i = active[a];
             const size_t picked = static_cast<size_t>(best_cpu.at<int32_t>(a));
             gen_ids[i].push_back(picked);
+            if (return_token_logprobs)
+              logprobs[i].push_back(step_logprobs_cpu.at<float>(a));
             if (want_attention) {
               const float* row = attn_cpu.index<float>({static_cast<dim_t>(a), 0});
               attn_flat[i].insert(attn_flat[i].end(), row, row + F_enc);
@@ -1417,7 +1490,7 @@ namespace ctranslate2 {
         }
       }
 
-      return {std::move(gen_ids), std::move(attn_out)};
+      return {std::move(gen_ids), std::move(attn_out), std::move(logprobs)};
     }
 
     std::vector<size_t>
@@ -1898,7 +1971,8 @@ namespace ctranslate2 {
         size_t max_new_tokens,
         size_t eot_id,
         std::vector<size_t> suppress_tokens,
-        std::vector<size_t> ban_first_tokens) {
+        std::vector<size_t> ban_first_tokens,
+        bool return_token_logprobs) {
       auto heads = get_alignment_heads_copy();
       return post<std::pair<WhisperDecoderState, std::vector<size_t>>>(
         [features = features.sync_copy(),
@@ -1907,6 +1981,7 @@ namespace ctranslate2 {
          eot_id,
          suppress_tokens = std::move(suppress_tokens),
          ban_first_tokens = std::move(ban_first_tokens),
+         return_token_logprobs,
          heads = std::move(heads)]
         (WhisperReplica& replica) mutable {
           replica.set_alignment_heads(heads);
@@ -1916,26 +1991,29 @@ namespace ctranslate2 {
               max_new_tokens,
               eot_id,
               suppress_tokens,
-              ban_first_tokens);
+              ban_first_tokens,
+              return_token_logprobs);
         });
     }
 
-    std::future<std::pair<std::vector<std::vector<size_t>>, std::vector<StorageView>>>
+    std::future<WhisperDualGreedyResult>
     Whisper::generate_dual_greedy(
         StorageView features,
         std::vector<std::vector<size_t>> prompts,
         size_t max_new_tokens,
         size_t eot_id,
         std::vector<size_t> suppress_tokens,
-        bool want_attention) {
+        bool want_attention,
+        bool return_token_logprobs) {
       auto heads = get_alignment_heads_copy();
-      return post<std::pair<std::vector<std::vector<size_t>>, std::vector<StorageView>>>(
+      return post<WhisperDualGreedyResult>(
         [features = features.sync_copy(),
          prompts = std::move(prompts),
          max_new_tokens,
          eot_id,
          suppress_tokens = std::move(suppress_tokens),
          want_attention,
+         return_token_logprobs,
          heads = std::move(heads)]
         (WhisperReplica& replica) mutable {
           if (want_attention)
@@ -1946,7 +2024,8 @@ namespace ctranslate2 {
               max_new_tokens,
               eot_id,
               suppress_tokens,
-              want_attention);
+              want_attention,
+              return_token_logprobs);
         });
     }
 

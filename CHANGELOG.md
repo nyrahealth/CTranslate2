@@ -2,6 +2,12 @@
 
 ### New features
 
+* Whisper: `return_token_logprobs` on `generate_greedy_with_attention`
+  and `generate_dual_greedy` (nyrahealth fork).  Fills
+  `state.collected_logprobs` (or a third per-row list on dual) with
+  `log_softmax(raw_logits)[token]` — full-vocabulary, before
+  `suppress_tokens` / `ban_first_tokens`, one value per returned id
+  including EOT.  Trimmed by `truncate_to_step`, copied by `deep_copy`.
 * Whisper: per-step cross-attention capture for word timings
   (`set_alignment_heads`, `prefill_with_attention`,
   `forward_step_with_attention`, `forward_step_greedy_with_attention`,

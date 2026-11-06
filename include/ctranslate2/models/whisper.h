@@ -83,6 +83,12 @@ namespace ctranslate2 {
       std::vector<float> text_token_probs;
     };
 
+    struct WhisperDualGreedyResult {
+      std::vector<std::vector<size_t>> ids;
+      std::vector<StorageView> attention;
+      std::vector<std::vector<float>> token_logprobs;
+    };
+
     struct WhisperDecoderState {
       layers::DecoderState state;
       dim_t current_step = 0;
@@ -95,6 +101,13 @@ namespace ctranslate2 {
       // (prompt_len+k)-th token, i.e. the row matching the k-th
       // generated token (0-indexed).
       std::vector<StorageView> collected_attention;
+      // Per-step log-probability of the emitted token, on the host.  Entry
+      // ``k`` is ``log_softmax(raw_logits_k)[ids[k]]`` over the full vocabulary
+      // of the raw logits (before ``suppress_tokens`` / ``ban_first_tokens``
+      // masking), i.e. what a teacher-forced pass over the same ids returns.
+      // Populated only by ``generate_greedy_with_attention`` with
+      // ``return_token_logprobs = true``; trimmed by ``truncate_to_step``.
+      std::vector<float> collected_logprobs;
 
       WhisperDecoderState() = default;
       WhisperDecoderState(WhisperDecoderState&&) = default;
@@ -108,6 +121,7 @@ namespace ctranslate2 {
         copy.collected_attention.reserve(collected_attention.size());
         for (const auto& a : collected_attention)
           copy.collected_attention.emplace_back(a);
+        copy.collected_logprobs = collected_logprobs;
         return copy;
       }
 
@@ -266,13 +280,20 @@ namespace ctranslate2 {
       // ``max_new_tokens`` steps.  Returns the new state (with
       // ``collected_attention`` populated) and the generated token
       // list (which may end with ``eot_id`` when EOT was emitted).
+      //
+      // ``return_token_logprobs``: also fill ``state.collected_logprobs``
+      // with one value per returned id (including a final EOT).  The
+      // log-softmax runs on the device over the raw logits; only the masked
+      // copy feeds the argmax.  The values are copied to the host once, at
+      // the end of the segment.
       std::pair<WhisperDecoderState, std::vector<size_t>>
       generate_greedy_with_attention(StorageView features,
                                      const std::vector<size_t>& prompt,
                                      size_t max_new_tokens,
                                      size_t eot_id,
                                      const std::vector<size_t>& suppress_tokens,
-                                     const std::vector<size_t>& ban_first_tokens);
+                                     const std::vector<size_t>& ban_first_tokens,
+                                     bool return_token_logprobs = false);
 
       // Greedy-decode several prompts that share the **same** audio in a
       // single batched decoder pass -- the encoder runs once and each row
@@ -298,15 +319,20 @@ namespace ctranslate2 {
       // ``want_attention``: when true, requires ``set_alignment_heads([...])``
       // first and returns, per row, the head-averaged post-softmax
       // cross-attention as a CPU ``[len(ids_row), F_enc]`` float32 matrix
-      // (1-to-1 with that row's ids).  When false the second element is a
-      // list of empty StorageViews.
-      std::pair<std::vector<std::vector<size_t>>, std::vector<StorageView>>
+      // (1-to-1 with that row's ids).  When false ``attention`` holds empty
+      // StorageViews.
+      //
+      // ``return_token_logprobs``: also fill ``token_logprobs`` with, per row,
+      // one value per returned id -- the same raw-logit log-probability as
+      // ``generate_greedy_with_attention(return_token_logprobs=true)``.
+      WhisperDualGreedyResult
       generate_dual_greedy(StorageView features,
                            const std::vector<std::vector<size_t>>& prompts,
                            size_t max_new_tokens,
                            size_t eot_id,
                            const std::vector<size_t>& suppress_tokens,
-                           bool want_attention);
+                           bool want_attention,
+                           bool return_token_logprobs = false);
 
       // Runs the entire *strict* speculative-decoding loop natively inside
       // a single thread-pool job: this replica is the verifier ("main"),
@@ -468,18 +494,20 @@ namespace ctranslate2 {
                                      size_t max_new_tokens,
                                      size_t eot_id,
                                      std::vector<size_t> suppress_tokens,
-                                     std::vector<size_t> ban_first_tokens);
+                                     std::vector<size_t> ban_first_tokens,
+                                     bool return_token_logprobs = false);
 
       // Async wrapper around ``WhisperReplica::generate_dual_greedy``.  The
       // whole batched (catch-up + lockstep) decode runs inside one job, so
       // the Python caller pays a single round-trip for both transcripts.
-      std::future<std::pair<std::vector<std::vector<size_t>>, std::vector<StorageView>>>
+      std::future<WhisperDualGreedyResult>
       generate_dual_greedy(StorageView features,
                            std::vector<std::vector<size_t>> prompts,
                            size_t max_new_tokens,
                            size_t eot_id,
                            std::vector<size_t> suppress_tokens,
-                           bool want_attention);
+                           bool want_attention,
+                           bool return_token_logprobs = false);
 
       // Async wrapper around ``WhisperReplica::generate_speculative``.
       // The whole strict speculative loop runs inside one job on *this*
